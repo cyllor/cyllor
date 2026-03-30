@@ -312,28 +312,13 @@ impl PageFlags {
     }
 }
 
-/// Configure MAIR_EL1 for memory attribute indices
+/// Log TCR/MAIR state set by Limine — do not modify, Limine already configured correctly
 pub fn init_mair() {
+    let tcr: u64;
+    let mair: u64;
     unsafe {
-        // Index 0: Normal memory (Write-Back, Read/Write Allocate)
-        // Index 1: Device-nGnRnE
-        let mair: u64 = 0x00000000000000FF | (0x04 << 8);
-        core::arch::asm!("msr MAIR_EL1, {}", in(reg) mair);
-
-        // Configure TCR_EL1 for 48-bit VA, 4KB granule
-        let tcr: u64 =
-            (16 << 0)  |  // T0SZ = 16 -> 48-bit user VA
-            (16 << 16) |  // T1SZ = 16 -> 48-bit kernel VA
-            (0b10 << 30) | // TG1 = 4KB granule for TTBR1
-            (0b00 << 14) | // TG0 = 4KB granule for TTBR0
-            (0b11 << 8)  | // IRGN0 = Write-Back
-            (0b11 << 10) | // ORGN0 = Write-Back
-            (0b11 << 24) | // IRGN1 = Write-Back
-            (0b11 << 26) | // ORGN1 = Write-Back
-            (0b10 << 12) | // SH0 = Inner Shareable
-            (0b10 << 28);  // SH1 = Inner Shareable
-        core::arch::asm!("msr TCR_EL1, {}", in(reg) tcr);
-        core::arch::asm!("isb");
+        core::arch::asm!("mrs {}, TCR_EL1", out(reg) tcr);
+        core::arch::asm!("mrs {}, MAIR_EL1", out(reg) mair);
     }
-    log::debug!("MAIR and TCR configured for 48-bit VA, 4KB granule");
+    log::debug!("Limine TCR_EL1=0x{tcr:016x} MAIR_EL1=0x{mair:016x}");
 }

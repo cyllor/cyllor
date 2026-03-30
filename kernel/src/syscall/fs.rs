@@ -4,11 +4,39 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> SyscallResult {
     match fd as u32 {
         1 | 2 => {
             // stdout / stderr -> UART
-            let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, count as usize) };
-            for &b in slice {
-                crate::drivers::uart::write_byte(b);
+            // buf is a user virtual address — translate to physical via HHDM
+            // Read TTBR0_EL1 to get the current user page table
+            let ttbr0: u64;
+            unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
+            let hhdm = crate::arch::aarch64::hhdm_offset();
+
+            // Walk page table manually to translate user VA to physical
+            // Debug: print hhdm and ttbr0
+            let hhdm_val = hhdm;
+            let ttbr0_val = ttbr0;
+            crate::drivers::uart::early_print("ttbr0=");
+            print_hex(ttbr0_val);
+            crate::drivers::uart::early_print(" hhdm=");
+            print_hex(hhdm_val);
+            crate::drivers::uart::early_print(" buf=");
+            print_hex(buf);
+            crate::drivers::uart::early_print("\n");
+
+            // Translate user VA using the page table walk
+            match walk_user_page_table(ttbr0, buf, hhdm) {
+                Some(pa) => {
+                    let kva = pa + hhdm;
+                    let slice = unsafe { core::slice::from_raw_parts(kva as *const u8, count as usize) };
+                    for &b in slice {
+                        crate::drivers::uart::write_byte(b);
+                    }
+                    Ok(count as usize)
+                }
+                None => {
+                    crate::drivers::uart::early_print("[write: VA translation failed]\n");
+                    Err(super::EFAULT)
+                }
             }
-            Ok(count as usize)
         }
         _ => {
             crate::fs::fd_write(fd as u32, buf, count as usize)
@@ -101,6 +129,73 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> SyscallResult {
 
 pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> SyscallResult {
     crate::fs::fcntl(fd, cmd, arg)
+}
+
+fn print_hex(val: u64) {
+    for i in (0..16).rev() {
+        let nibble = ((val >> (i * 4)) & 0xF) as u8;
+        let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        crate::drivers::uart::write_byte(c);
+    }
+}
+
+/// Walk user page table (TTBR0) to translate VA to PA
+fn walk_user_page_table(ttbr0: u64, va: u64, hhdm: u64) -> Option<u64> {
+    let indices = [
+        ((va >> 39) & 0x1FF) as usize,
+        ((va >> 30) & 0x1FF) as usize,
+        ((va >> 21) & 0x1FF) as usize,
+        ((va >> 12) & 0x1FF) as usize,
+    ];
+
+    crate::drivers::uart::early_print("walk: idx=");
+    for &i in &indices {
+        print_hex(i as u64);
+        crate::drivers::uart::early_print(" ");
+    }
+    crate::drivers::uart::early_print("\n");
+
+    let mut table_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
+
+    for level in 0..3 {
+        let table_virt = (table_phys + hhdm) as *const u64;
+        crate::drivers::uart::early_print("L");
+        crate::drivers::uart::write_byte(b'0' + level as u8);
+        crate::drivers::uart::early_print(": tbl=");
+        print_hex(table_phys + hhdm);
+        crate::drivers::uart::early_print(" [");
+        print_hex(indices[level] as u64);
+        crate::drivers::uart::early_print("]\n");
+
+        let entry = unsafe { core::ptr::read_volatile(table_virt.add(indices[level])) };
+        crate::drivers::uart::early_print("  entry=");
+        print_hex(entry);
+        crate::drivers::uart::early_print("\n");
+
+        if entry & 1 == 0 {
+            crate::drivers::uart::early_print("  INVALID!\n");
+            return None;
+        }
+        table_phys = entry & 0x0000_FFFF_FFFF_F000;
+    }
+
+    let l3_virt = (table_phys + hhdm) as *const u64;
+    crate::drivers::uart::early_print("L3: tbl=");
+    print_hex(table_phys + hhdm);
+    crate::drivers::uart::early_print("\n");
+
+    let entry = unsafe { core::ptr::read_volatile(l3_virt.add(indices[3])) };
+    crate::drivers::uart::early_print("  entry=");
+    print_hex(entry);
+    crate::drivers::uart::early_print("\n");
+
+    if entry & 1 == 0 {
+        crate::drivers::uart::early_print("  INVALID!\n");
+        return None;
+    }
+
+    let page_phys = entry & 0x0000_FFFF_FFFF_F000;
+    Some(page_phys | (va & 0xFFF))
 }
 
 unsafe fn cstr_from_user(ptr: u64) -> Result<&'static str, i32> {

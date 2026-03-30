@@ -188,7 +188,9 @@ extern "C" fn sync_handler_rust(frame: *mut TrapFrame) {
             crate::syscall::handle(unsafe { &mut *frame });
         }
         _ => {
-            log::error!("Sync exception: EC=0x{ec:02x} ESR=0x{esr:016x} ELR=0x{elr:016x}");
+            let far: u64;
+            unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
+            log::error!("Sync exception: EC=0x{ec:02x} ESR=0x{esr:016x} ELR=0x{elr:016x} FAR=0x{far:016x}");
             loop { core::hint::spin_loop(); }
         }
     }

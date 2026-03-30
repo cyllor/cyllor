@@ -133,8 +133,8 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
             let map_size = (aligned_end - aligned_start) as usize;
 
             let flags = phdr_to_pageflags(phdr.p_flags);
-            // Map with RW first, then change permissions after copy
-            aspace.map_anon(aligned_start, map_size, PageFlags::USER_RW)
+            // Map with final permissions - data is copied via HHDM (kernel virtual)
+            aspace.map_anon(aligned_start, map_size, flags)
                 .map_err(|_| "Failed to map segment")?;
 
             // Copy file data
