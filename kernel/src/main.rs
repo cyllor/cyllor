@@ -76,7 +76,7 @@ unsafe extern "C" fn _start() -> ! {
     create_test_elf();
 
     // Spawn init process
-    let init_paths = ["/sbin/init", "/bin/bash", "/bin/hello"];
+    let init_paths = ["/bin/hello_dyn", "/sbin/init", "/bin/bash", "/bin/hello"];
     for path in &init_paths {
         match sched::spawn_user_process(path, &[path.as_bytes()], &[
             b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -283,6 +283,7 @@ fn load_rootfs_to_vfs() {
         "/sbin/init", "/usr/sbin/init",
         "/bin/bash", "/usr/bin/bash",
         "/bin/sh", "/usr/bin/sh",
+        "/bin/hello", "/bin/hello_dyn",
         "/usr/bin/weston",
         "/usr/bin/startxfce4",
         "/usr/bin/xfce4-session",
