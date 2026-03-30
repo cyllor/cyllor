@@ -7,10 +7,10 @@ use core::arch::global_asm;
 pub static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 
 pub struct Scheduler {
-    run_queues: Vec<VecDeque<Thread>>,
-    current: Vec<Option<Thread>>,
-    num_cpus: usize,
-    initialized: bool,
+    pub run_queues: Vec<VecDeque<Thread>>,
+    pub current: Vec<Option<Thread>>,
+    pub num_cpus: usize,
+    pub initialized: bool,
 }
 
 impl Scheduler {
@@ -42,9 +42,7 @@ pub fn spawn_kernel_thread(name: &str, entry: fn()) -> Pid {
     let pid = thread.pid;
 
     let mut sched = SCHEDULER.lock();
-    // Simple: push to CPU 0's runqueue, work stealing will balance later
     if !sched.run_queues.is_empty() {
-        // Find the shortest queue
         let min_cpu = (0..sched.num_cpus)
             .min_by_key(|&i| sched.run_queues[i].len())
             .unwrap_or(0);
@@ -69,7 +67,7 @@ pub fn schedule() {
         // Try work stealing from other CPUs
         let stolen = try_steal(&mut sched, cpu_id);
         if stolen.is_none() {
-            return; // Nothing to do, keep running current
+            return;
         }
         do_switch(&mut sched, cpu_id, stolen.unwrap());
         return;
@@ -93,27 +91,45 @@ fn try_steal(sched: &mut Scheduler, cpu_id: usize) -> Option<Thread> {
 fn do_switch(sched: &mut Scheduler, cpu_id: usize, mut next: Thread) {
     let mut current = sched.current[cpu_id].take().unwrap();
 
-    if current.pid == 0 {
-        // Idle thread, just replace
+    if current.pid == 0 && !next.is_user {
+        // Idle -> kernel thread: just replace
         next.state = ThreadState::Running;
         sched.current[cpu_id] = Some(next);
         return;
     }
 
+    // For user threads on first run, set up x19-x22 for the trampoline
+    if next.is_user && next.state == ThreadState::Ready {
+        next.context.x19 = next.context.elr;     // entry point
+        next.context.x20 = next.context.spsr;    // SPSR (EL0t)
+        next.context.x21 = next.context.sp_el0;  // user stack
+        next.context.x22 = next.context.ttbr0;   // page table
+    }
+
     if current.state == ThreadState::Running {
         current.state = ThreadState::Ready;
-        sched.run_queues[cpu_id].push_back(current);
+        if current.pid != 0 {
+            sched.run_queues[cpu_id].push_back(current);
+        }
     }
 
     next.state = ThreadState::Running;
 
-    // Get raw pointers for context switch
-    let old_ctx = &mut sched.current[cpu_id] as *mut Option<Thread>;
-    // We need to store next first, then switch
+    // For user threads, switch TTBR0
+    if next.is_user {
+        unsafe {
+            core::arch::asm!(
+                "msr TTBR0_EL1, {}",
+                "isb",
+                in(reg) next.context.ttbr0,
+            );
+        }
+    }
+
     sched.current[cpu_id] = Some(next);
 
-    // TODO: actual context switch via assembly
-    // For now this is cooperative - the thread runs until it yields
+    // Real context switch would happen here via context_switch()
+    // For now, the trampoline handles first-time user entry
 }
 
 fn current_cpu_id() -> usize {
@@ -127,7 +143,6 @@ global_asm!(
     ".global context_switch",
     "context_switch:",
     // x0 = old Context*, x1 = new Context*
-    // Save callee-saved registers to old context
     "stp x19, x20, [x0, #0]",
     "stp x21, x22, [x0, #16]",
     "stp x23, x24, [x0, #32]",
@@ -137,7 +152,6 @@ global_asm!(
     "mov x2, sp",
     "str x2, [x0, #96]",
 
-    // Restore callee-saved registers from new context
     "ldp x19, x20, [x1, #0]",
     "ldp x21, x22, [x1, #16]",
     "ldp x23, x24, [x1, #32]",

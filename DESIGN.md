@@ -4,6 +4,15 @@
 从零开发一个 Rust 操作系统，支持 AArch64/x86-64 双架构，多核调度，最终目标运行 XFCE 桌面。
 核心原则：**最少代码，最大复用**。
 
+## Constraints / 约束条件
+- **C 库**: 使用 **glibc** (GNU C Library)，不使用 musl libc
+  - 原因: XFCE/GTK 生态通常基于 glibc 构建，glibc 提供最广泛的 Linux ABI 兼容性
+  - 影响: 需要实现 glibc 依赖的全部 syscall（比 musl 多），包括 `clone3`, `rseq`, `memfd_create` 等
+  - Rootfs: 基于 Debian/Ubuntu aarch64 glibc 根文件系统
+- **验证平台**: 主验证平台为 **AArch64** (qemu-system-aarch64)
+- **引导**: Limine v8 引导协议，UEFI 启动
+- **内核架构**: 宏内核 (Monolithic)，驱动运行在内核态
+
 ## Architecture Overview
 
 ```

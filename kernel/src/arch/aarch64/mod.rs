@@ -2,6 +2,7 @@ use crate::arch::Arch;
 
 pub mod exceptions;
 pub mod gic;
+pub mod paging;
 pub mod timer;
 
 pub struct Aarch64Arch;

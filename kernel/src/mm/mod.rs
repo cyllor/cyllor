@@ -1,4 +1,4 @@
-mod pmm;
+pub mod pmm;
 mod heap;
 mod mmap;
 
