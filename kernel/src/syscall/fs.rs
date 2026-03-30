@@ -11,18 +11,6 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> SyscallResult {
             let hhdm = crate::arch::aarch64::hhdm_offset();
 
             // Walk page table manually to translate user VA to physical
-            // Debug: print hhdm and ttbr0
-            let hhdm_val = hhdm;
-            let ttbr0_val = ttbr0;
-            crate::drivers::uart::early_print("ttbr0=");
-            print_hex(ttbr0_val);
-            crate::drivers::uart::early_print(" hhdm=");
-            print_hex(hhdm_val);
-            crate::drivers::uart::early_print(" buf=");
-            print_hex(buf);
-            crate::drivers::uart::early_print("\n");
-
-            // Translate user VA using the page table walk
             match walk_user_page_table(ttbr0, buf, hhdm) {
                 Some(pa) => {
                     let kva = pa + hhdm;
