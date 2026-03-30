@@ -276,7 +276,7 @@ impl PageFlags {
     pub const KERNEL_RWX: Self = Self { readable: true, writable: true, executable: true, user: false, device: false };
     pub const DEVICE: Self = Self { readable: true, writable: true, executable: false, user: false, device: true };
 
-    fn to_pte(self) -> u64 {
+    pub fn to_pte(self) -> u64 {
         let mut flags: u64 = PTE_SH_INNER;
 
         if self.device {
