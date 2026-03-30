@@ -121,17 +121,22 @@ fn init_block_device(mmio: VirtioMmio, hhdm: u64) {
     let capacity: u64 = mmio.read_config(0);
     log::info!("VirtIO block: {} sectors ({} MiB)", capacity, capacity * 512 / (1024 * 1024));
 
-    // Allocate virtqueue memory
-    let desc_phys = pmm::alloc_page().unwrap() as u64;
-    let avail_phys = pmm::alloc_page().unwrap() as u64;
-    let used_phys = pmm::alloc_page().unwrap() as u64;
-
-    // Zero the pages
+    // For v1 legacy, virtqueue must be in a single contiguous region:
+    //   desc (16 * queue_size) | avail (6 + 2*queue_size) | padding | used (6 + 8*queue_size)
+    // Allocate 2 contiguous pages for the queue
+    let queue_phys = pmm::alloc_page().unwrap() as u64;
+    let queue_phys2 = pmm::alloc_page().unwrap() as u64;
     unsafe {
-        ptr::write_bytes((desc_phys + hhdm) as *mut u8, 0, 4096);
-        ptr::write_bytes((avail_phys + hhdm) as *mut u8, 0, 4096);
-        ptr::write_bytes((used_phys + hhdm) as *mut u8, 0, 4096);
+        ptr::write_bytes((queue_phys + hhdm) as *mut u8, 0, 4096);
+        ptr::write_bytes((queue_phys2 + hhdm) as *mut u8, 0, 4096);
     }
+
+    // Layout within the pages:
+    let desc_phys = queue_phys;
+    // avail ring starts after descriptors: 16 * QUEUE_SIZE = 256 bytes
+    let avail_phys = queue_phys + (16 * QUEUE_SIZE as u64);
+    // used ring must be on a 4096-byte boundary for legacy
+    let used_phys = queue_phys2; // Second page
 
     // Set up virtqueue
     mmio.setup_queue(0, QUEUE_SIZE, desc_phys, avail_phys, used_phys);
@@ -220,6 +225,7 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
 
         // Wait for completion (poll used ring)
         let used = dev.used_ptr;
+        let mut timeout = 0u32;
         loop {
             fence(Ordering::Acquire);
             let used_idx = unsafe { ptr::read_volatile(&(*used).idx) };
@@ -227,6 +233,10 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
                 break;
             }
             core::hint::spin_loop();
+            timeout += 1;
+            if timeout > 10_000_000 {
+                return Err("Block read timeout");
+            }
         }
         dev.last_used_idx = dev.last_used_idx.wrapping_add(1);
         dev.mmio.ack_interrupt();
@@ -234,7 +244,7 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
         // Check status
         let status = unsafe { *dev.status_ptr };
         if status != 0 {
-            return Err("Block read failed");
+            return Err("Block read I/O error");
         }
 
         // Copy data to output buffer

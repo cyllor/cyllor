@@ -119,7 +119,7 @@ pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> SyscallResult {
     crate::fs::fcntl(fd, cmd, arg)
 }
 
-fn print_hex(val: u64) {
+pub fn print_hex(val: u64) {
     for i in (0..16).rev() {
         let nibble = ((val >> (i * 4)) & 0xF) as u8;
         let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };

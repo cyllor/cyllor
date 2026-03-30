@@ -47,6 +47,17 @@ unsafe extern "C" fn _start() -> ! {
     let hhdm = arch::aarch64::hhdm_offset();
     drivers::virtio::block::probe(hhdm);
 
+    // Test disk read
+    {
+        let mut test_buf = [0u8; 1024];
+        match drivers::virtio::block::read_sectors(2, 2, &mut test_buf) {
+            Ok(()) => {
+                log::info!("Disk read OK: magic=0x{:04x}", u16::from_le_bytes([test_buf[0x38], test_buf[0x39]]));
+            }
+            Err(e) => log::error!("Disk read failed: {e}"),
+        }
+    }
+
     // Try to mount ext4 from VirtIO block device
     match fs::ext4::mount() {
         Ok(()) => {
@@ -61,7 +72,7 @@ unsafe extern "C" fn _start() -> ! {
     }
 
     // Spawn init process
-    let init_paths = ["/sbin/init", "/bin/init", "/bin/sh", "/bin/hello"];
+    let init_paths = ["/bin/hello", "/sbin/init", "/bin/init", "/bin/sh"];
     for path in &init_paths {
         match sched::spawn_user_process(path, &[path.as_bytes()], &[
             b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",

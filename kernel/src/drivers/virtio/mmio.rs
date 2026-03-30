@@ -15,14 +15,16 @@ const DRIVER_FEATURES_SEL: usize = 0x024;
 const QUEUE_SEL: usize = 0x030;
 const QUEUE_NUM_MAX: usize = 0x034;
 const QUEUE_NUM: usize = 0x038;
-const QUEUE_READY: usize = 0x044;
+const QUEUE_ALIGN: usize = 0x03C;
+const QUEUE_PFN: usize = 0x040;     // v1: page frame number
+const QUEUE_READY: usize = 0x044;   // v2 only
 const QUEUE_NOTIFY: usize = 0x050;
 const INTERRUPT_STATUS: usize = 0x060;
 const INTERRUPT_ACK: usize = 0x064;
 const STATUS: usize = 0x070;
-const QUEUE_DESC_LOW: usize = 0x080;
-const QUEUE_DESC_HIGH: usize = 0x084;
-const QUEUE_DRIVER_LOW: usize = 0x090;
+const QUEUE_DESC_LOW: usize = 0x080;   // v2 only
+const QUEUE_DESC_HIGH: usize = 0x084;  // v2 only
+const QUEUE_DRIVER_LOW: usize = 0x090; // v2 only
 const QUEUE_DRIVER_HIGH: usize = 0x094;
 const QUEUE_DEVICE_LOW: usize = 0x0A0;
 const QUEUE_DEVICE_HIGH: usize = 0x0A4;
@@ -39,11 +41,12 @@ const VIRTIO_MAGIC: u32 = 0x74726976; // "virt"
 
 pub struct VirtioMmio {
     base: usize,
+    version: u32,
 }
 
 impl VirtioMmio {
     pub fn new(base: usize) -> Option<Self> {
-        let dev = Self { base };
+        let dev = Self { base, version: 0 };
         let magic = dev.read32(MAGIC);
         if magic != VIRTIO_MAGIC {
             return None;
@@ -52,7 +55,7 @@ impl VirtioMmio {
         if version != 1 && version != 2 {
             return None;
         }
-        Some(dev)
+        Some(Self { base, version })
     }
 
     pub fn device_id(&self) -> u32 {
@@ -91,13 +94,26 @@ impl VirtioMmio {
                        desc_phys: u64, avail_phys: u64, used_phys: u64) {
         self.write32(QUEUE_SEL, queue_idx);
         self.write32(QUEUE_NUM, queue_size as u32);
-        self.write32(QUEUE_DESC_LOW, desc_phys as u32);
-        self.write32(QUEUE_DESC_HIGH, (desc_phys >> 32) as u32);
-        self.write32(QUEUE_DRIVER_LOW, avail_phys as u32);
-        self.write32(QUEUE_DRIVER_HIGH, (avail_phys >> 32) as u32);
-        self.write32(QUEUE_DEVICE_LOW, used_phys as u32);
-        self.write32(QUEUE_DEVICE_HIGH, (used_phys >> 32) as u32);
-        self.write32(QUEUE_READY, 1);
+
+        if self.version == 1 {
+            // Legacy: set page frame number of the entire virtqueue
+            // The queue is laid out contiguously: desc, avail, used
+            self.write32(QUEUE_ALIGN, 4096);
+            self.write32(QUEUE_PFN, (desc_phys / 4096) as u32);
+        } else {
+            // Modern: separate addresses
+            self.write32(QUEUE_DESC_LOW, desc_phys as u32);
+            self.write32(QUEUE_DESC_HIGH, (desc_phys >> 32) as u32);
+            self.write32(QUEUE_DRIVER_LOW, avail_phys as u32);
+            self.write32(QUEUE_DRIVER_HIGH, (avail_phys >> 32) as u32);
+            self.write32(QUEUE_DEVICE_LOW, used_phys as u32);
+            self.write32(QUEUE_DEVICE_HIGH, (used_phys >> 32) as u32);
+            self.write32(QUEUE_READY, 1);
+        }
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        self.version == 1
     }
 
     pub fn queue_max_size(&self, queue_idx: u32) -> u32 {
