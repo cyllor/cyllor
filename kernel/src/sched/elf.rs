@@ -177,9 +177,35 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
 
     if let Some(ref path) = interp_path {
         log::debug!("ELF interpreter: {}", path);
-        // TODO: Load interpreter from filesystem
-        // For now, the interp loading will be done by do_execve
-        // which reads the interp ELF and loads it at a separate base
+        // Try to read interpreter from VFS
+        match crate::fs::vfs::resolve_path(path) {
+            Ok(node) => {
+                let interp_data = node.lock().data.clone();
+                if !interp_data.is_empty() {
+                    // Load interpreter at a fixed high address
+                    let ld_base: u64 = 0x0000_0050_0000_0000; // 320 GiB
+                    let ld_result = load_interp(&interp_data, aspace, ld_base)?;
+                    interp_base = ld_base;
+                    final_entry = ld_result.entry;
+                    log::info!("Loaded interpreter at 0x{:x}, entry=0x{:x}", ld_base, ld_result.entry);
+                }
+            }
+            Err(_) => {
+                // Try ext4
+                match crate::fs::ext4::read_file(path) {
+                    Ok(interp_data) => {
+                        let ld_base: u64 = 0x0000_0050_0000_0000;
+                        let ld_result = load_interp(&interp_data, aspace, ld_base)?;
+                        interp_base = ld_base;
+                        final_entry = ld_result.entry;
+                        log::info!("Loaded interpreter at 0x{:x}, entry=0x{:x}", ld_base, ld_result.entry);
+                    }
+                    Err(_) => {
+                        log::warn!("Interpreter {} not found, trying static", path);
+                    }
+                }
+            }
+        }
     }
 
     Ok(ElfLoadResult {
@@ -312,6 +338,61 @@ pub fn setup_user_stack(
     push_u64(&mut sp, argv.len() as u64, aspace)?;
 
     Ok(sp)
+}
+
+/// Load an ELF interpreter (ld-linux) at a given base address
+fn load_interp(data: &[u8], aspace: &AddressSpace, base: u64) -> Result<InterpResult, &'static str> {
+    if data.len() < core::mem::size_of::<Elf64Ehdr>() {
+        return Err("Interpreter ELF too small");
+    }
+
+    let ehdr = unsafe { &*(data.as_ptr() as *const Elf64Ehdr) };
+    if ehdr.e_ident[0..4] != ELF_MAGIC {
+        return Err("Interpreter: bad ELF magic");
+    }
+
+    let phdrs = unsafe {
+        core::slice::from_raw_parts(
+            data.as_ptr().add(ehdr.e_phoff as usize) as *const Elf64Phdr,
+            ehdr.e_phnum as usize,
+        )
+    };
+
+    // Find the lowest vaddr to compute the load bias
+    let mut min_vaddr = u64::MAX;
+    for phdr in phdrs {
+        if phdr.p_type == PT_LOAD && phdr.p_vaddr < min_vaddr {
+            min_vaddr = phdr.p_vaddr;
+        }
+    }
+    let load_bias = base - (min_vaddr & !(PAGE_SIZE as u64 - 1));
+
+    for phdr in phdrs {
+        if phdr.p_type == PT_LOAD {
+            let vaddr = phdr.p_vaddr + load_bias;
+            let aligned_start = vaddr & !(PAGE_SIZE as u64 - 1);
+            let aligned_end = (vaddr + phdr.p_memsz + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+            let map_size = (aligned_end - aligned_start) as usize;
+
+            let flags = phdr_to_pageflags(phdr.p_flags);
+            aspace.map_anon(aligned_start, map_size, flags)
+                .map_err(|_| "Failed to map interp segment")?;
+
+            if phdr.p_filesz > 0 {
+                let file_data = &data[phdr.p_offset as usize..(phdr.p_offset + phdr.p_filesz) as usize];
+                aspace.copy_to_user(vaddr, file_data)
+                    .map_err(|_| "Failed to copy interp data")?;
+            }
+        }
+    }
+
+    Ok(InterpResult {
+        entry: ehdr.e_entry + load_bias,
+    })
+}
+
+struct InterpResult {
+    entry: u64,
 }
 
 fn phdr_to_pageflags(p_flags: u32) -> PageFlags {

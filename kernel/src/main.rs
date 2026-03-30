@@ -62,6 +62,7 @@ unsafe extern "C" fn _start() -> ! {
     match fs::ext4::mount() {
         Ok(()) => {
             log::info!("ext4 root filesystem mounted");
+            // Removed verbose debug output
             // Load ext4 files into VFS
             load_rootfs_to_vfs();
         }
@@ -75,7 +76,7 @@ unsafe extern "C" fn _start() -> ! {
     create_test_elf();
 
     // Spawn init process
-    let init_paths = ["/sbin/init", "/bin/bash", "/bin/sh", "/bin/hello"];
+    let init_paths = ["/sbin/init", "/bin/bash", "/bin/hello"];
     for path in &init_paths {
         match sched::spawn_user_process(path, &[path.as_bytes()], &[
             b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -265,15 +266,23 @@ fn create_test_elf() {
 fn load_rootfs_to_vfs() {
     // Only load specific binaries needed for init, not everything
     let critical_files = [
-        "/sbin/init",
-        "/bin/bash",
-        "/bin/sh",
+        // Dynamic linker (try both usrmerge and classic paths)
         "/lib/ld-linux-aarch64.so.1",
-        "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+        "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+        // glibc core
         "/lib/aarch64-linux-gnu/libc.so.6",
-        "/lib/aarch64-linux-gnu/libdl.so.2",
-        "/lib/aarch64-linux-gnu/libpthread.so.0",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
         "/lib/aarch64-linux-gnu/libm.so.6",
+        "/lib/aarch64-linux-gnu/libdl.so.2",
+        "/usr/lib/aarch64-linux-gnu/libdl.so.2",
+        "/lib/aarch64-linux-gnu/libpthread.so.0",
+        "/lib/aarch64-linux-gnu/libgcc_s.so.1",
+        "/lib/aarch64-linux-gnu/libtinfo.so.6",
+        "/lib/aarch64-linux-gnu/libreadline.so.8",
+        // Binaries
+        "/sbin/init", "/usr/sbin/init",
+        "/bin/bash", "/usr/bin/bash",
+        "/bin/sh", "/usr/bin/sh",
         "/usr/bin/weston",
         "/usr/bin/startxfce4",
         "/usr/bin/xfce4-session",
@@ -295,14 +304,33 @@ fn load_rootfs_to_vfs() {
                     let size = data.len();
                     inode.data = data;
                     inode.size = size;
+                    let node = alloc::sync::Arc::new(spin::Mutex::new(inode));
                     pn.children.insert(
                         alloc::string::ToString::to_string(name),
-                        alloc::sync::Arc::new(spin::Mutex::new(inode)),
+                        node,
                     );
                     log::debug!("Loaded {} ({} KiB)", path, size / 1024);
                 }
             }
-            Err(_) => {} // File not found in ext4, skip
+            Err(_) => {}
+        }
+
+        // For ld-linux, also create a copy at /lib/ld-linux-aarch64.so.1
+        if path.contains("ld-linux") {
+            if let Ok(data) = fs::ext4::read_file(path) {
+                let size = data.len();
+                if let Ok(lib_node) = fs::vfs::resolve_path("/lib") {
+                    let mut ln = lib_node.lock();
+                    let mut inode = fs::vfs::Inode::new_file(0o755);
+                    inode.data = data;
+                    inode.size = size;
+                    ln.children.insert(
+                        alloc::string::ToString::to_string("ld-linux-aarch64.so.1"),
+                        alloc::sync::Arc::new(spin::Mutex::new(inode)),
+                    );
+                    log::debug!("Linked /lib/ld-linux-aarch64.so.1 ({} KiB)", size / 1024);
+                }
+            }
         }
     }
 }

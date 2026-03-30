@@ -136,49 +136,20 @@ fn walk_user_page_table(ttbr0: u64, va: u64, hhdm: u64) -> Option<u64> {
         ((va >> 12) & 0x1FF) as usize,
     ];
 
-    crate::drivers::uart::early_print("walk: idx=");
-    for &i in &indices {
-        print_hex(i as u64);
-        crate::drivers::uart::early_print(" ");
-    }
-    crate::drivers::uart::early_print("\n");
-
     let mut table_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
 
     for level in 0..3 {
         let table_virt = (table_phys + hhdm) as *const u64;
-        crate::drivers::uart::early_print("L");
-        crate::drivers::uart::write_byte(b'0' + level as u8);
-        crate::drivers::uart::early_print(": tbl=");
-        print_hex(table_phys + hhdm);
-        crate::drivers::uart::early_print(" [");
-        print_hex(indices[level] as u64);
-        crate::drivers::uart::early_print("]\n");
-
         let entry = unsafe { core::ptr::read_volatile(table_virt.add(indices[level])) };
-        crate::drivers::uart::early_print("  entry=");
-        print_hex(entry);
-        crate::drivers::uart::early_print("\n");
-
         if entry & 1 == 0 {
-            crate::drivers::uart::early_print("  INVALID!\n");
             return None;
         }
         table_phys = entry & 0x0000_FFFF_FFFF_F000;
     }
 
     let l3_virt = (table_phys + hhdm) as *const u64;
-    crate::drivers::uart::early_print("L3: tbl=");
-    print_hex(table_phys + hhdm);
-    crate::drivers::uart::early_print("\n");
-
     let entry = unsafe { core::ptr::read_volatile(l3_virt.add(indices[3])) };
-    crate::drivers::uart::early_print("  entry=");
-    print_hex(entry);
-    crate::drivers::uart::early_print("\n");
-
     if entry & 1 == 0 {
-        crate::drivers::uart::early_print("  INVALID!\n");
         return None;
     }
 

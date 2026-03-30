@@ -367,8 +367,16 @@ impl Ext4Fs {
         Ok(data)
     }
 
-    /// Lookup a path and return inode number
+    /// Lookup a path and return inode number, following symlinks
     pub fn lookup(&self, path: &str) -> Result<u32, &'static str> {
+        self.lookup_with_depth(path, 0)
+    }
+
+    fn lookup_with_depth(&self, path: &str, depth: usize) -> Result<u32, &'static str> {
+        if depth > 8 {
+            return Err("Too many symlinks");
+        }
+
         let path = path.trim_start_matches('/');
         if path.is_empty() {
             return Ok(EXT4_ROOT_INO);
@@ -377,15 +385,55 @@ impl Ext4Fs {
         let mut current_ino = EXT4_ROOT_INO;
         for component in path.split('/') {
             if component.is_empty() || component == "." { continue; }
+            if component == ".." {
+                // Stay at root for simplicity
+                continue;
+            }
             let entries = self.read_dir(current_ino)?;
             let found = entries.iter().find(|(name, _, _)| name == component);
             match found {
-                Some((_, ino, _)) => current_ino = *ino,
+                Some((_, ino, ftype)) => {
+                    current_ino = *ino;
+                    // Check if this is a symlink (ftype 7)
+                    if *ftype == 7 {
+                        let target = self.read_symlink(current_ino)?;
+                        if target.starts_with('/') {
+                            current_ino = self.lookup_with_depth(&target, depth + 1)?;
+                        } else {
+                            // Relative symlink: not fully supported yet
+                            current_ino = self.lookup_with_depth(&target, depth + 1)?;
+                        }
+                    }
+                }
                 None => return Err("File not found"),
             }
         }
 
         Ok(current_ino)
+    }
+
+    /// Read symlink target from inode
+    fn read_symlink(&self, ino: u32) -> Result<String, &'static str> {
+        let inode = self.read_inode(ino)?;
+        let size = self.inode_size(&inode) as usize;
+
+        if size <= 60 {
+            // Fast symlink: target stored inline in i_block
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    inode.i_block.as_ptr() as *const u8,
+                    size,
+                )
+            };
+            let s = core::str::from_utf8(bytes).map_err(|_| "Invalid symlink")?;
+            Ok(String::from(s))
+        } else {
+            // Slow symlink: target stored in data blocks
+            let mut data = alloc::vec![0u8; size];
+            self.read_extents(&inode, 0, &mut data)?;
+            let s = core::str::from_utf8(&data).map_err(|_| "Invalid symlink")?;
+            Ok(String::from(s))
+        }
     }
 
     /// Read a file by path

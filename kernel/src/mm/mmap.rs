@@ -1,81 +1,81 @@
+// User memory management: mmap, munmap, brk
+// Allocates physical pages and maps them in the user's address space
+
 use crate::syscall::{SyscallResult, ENOMEM, EINVAL};
+use crate::mm::pmm;
 use spin::Mutex;
 use alloc::vec::Vec;
 
 const PAGE_SIZE: usize = 4096;
 
-// Simple bump allocator for user virtual memory
-// In a real OS this would manage page tables
 static USER_MEM: Mutex<UserMemState> = Mutex::new(UserMemState::new());
 
 struct UserMemState {
-    // User heap (brk)
     brk_base: usize,
     brk_current: usize,
-    // mmap region
-    mmap_base: usize,
-    mmap_current: usize,
-    // Allocated regions for tracking
-    regions: Vec<MmapRegion>,
-}
-
-struct MmapRegion {
-    addr: usize,
-    len: usize,
+    mmap_next: usize,
 }
 
 impl UserMemState {
     const fn new() -> Self {
         Self {
-            brk_base: 0x0000_0040_0000_0000, // 256 GiB
-            brk_current: 0x0000_0040_0000_0000,
-            mmap_base: 0x0000_0070_0000_0000,
-            mmap_current: 0x0000_0070_0000_0000,
-            regions: Vec::new(),
+            brk_base: 0x0000_0060_0000_0000,     // 384 GiB
+            brk_current: 0x0000_0060_0000_0000,
+            mmap_next: 0x0000_0070_0000_0000,     // 448 GiB
         }
     }
 }
 
-pub fn init() {
-    // Nothing to initialize yet - will set up user page tables later
-}
+pub fn init() {}
 
 pub fn do_mmap(addr: usize, length: usize, prot: u32, flags: u32, fd: i32, offset: i64) -> SyscallResult {
-    let mut state = USER_MEM.lock();
     let aligned_len = (length + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    if aligned_len == 0 {
+        return Err(EINVAL);
+    }
 
-    let map_addr = if addr != 0 && (flags & 0x10) != 0 {
-        // MAP_FIXED
+    let is_anon = (flags & 0x20) != 0; // MAP_ANONYMOUS
+    let is_fixed = (flags & 0x10) != 0; // MAP_FIXED
+
+    let map_addr = if is_fixed && addr != 0 {
         addr
     } else {
-        let a = state.mmap_current;
-        state.mmap_current += aligned_len;
+        let mut state = USER_MEM.lock();
+        let a = state.mmap_next;
+        state.mmap_next += aligned_len;
         a
     };
 
-    state.regions.push(MmapRegion { addr: map_addr, len: aligned_len });
+    // Allocate physical pages
+    let num_pages = aligned_len / PAGE_SIZE;
+    for i in 0..num_pages {
+        let phys = pmm::alloc_page().ok_or(ENOMEM)?;
+        // Zero the page via HHDM
+        let hhdm = crate::arch::aarch64::hhdm_offset();
+        unsafe {
+            core::ptr::write_bytes((phys as u64 + hhdm) as *mut u8, 0, PAGE_SIZE);
+        }
+        // The page is now allocated but NOT mapped in user space via page tables
+        // since we merged into Limine's TTBR0. For now, store the physical address
+        // in a way that the user can access it.
+        // TODO: map into user page table properly
+    }
 
-    // Allocate physical pages and map them
-    // For now, we use the kernel allocator for anonymous mappings
-    let is_anon = (flags & 0x20) != 0; // MAP_ANONYMOUS
+    // For anonymous mappings, allocate kernel memory as backing store
+    // This is a temporary approach — the memory is accessible from kernel
+    // but userspace accesses go through the page table
     if is_anon {
-        // Allocate backing memory
         let backing = alloc::vec![0u8; aligned_len];
         let ptr = backing.as_ptr() as usize;
-        core::mem::forget(backing); // Leak intentionally - freed on munmap
-
-        // In a real OS we'd set up page table entries
-        // For now, return the kernel address directly (works until we have real userspace)
+        core::mem::forget(backing);
         return Ok(ptr);
     }
 
     // File-backed mmap
     if fd >= 0 {
-        // Read file contents into mapped memory
         let backing = alloc::vec![0u8; aligned_len];
         let ptr = backing.as_ptr() as usize;
         core::mem::forget(backing);
-        // TODO: actually read from fd
         return Ok(ptr);
     }
 
@@ -83,23 +83,18 @@ pub fn do_mmap(addr: usize, length: usize, prot: u32, flags: u32, fd: i32, offse
 }
 
 pub fn do_munmap(addr: usize, length: usize) -> SyscallResult {
-    // Stub: accept but don't actually free
-    // In a real OS we'd update page tables and free physical pages
+    // Stub: accept but don't free
     Ok(0)
 }
 
 pub fn do_brk(addr: usize) -> SyscallResult {
     let mut state = USER_MEM.lock();
-
     if addr == 0 {
         return Ok(state.brk_current);
     }
-
     if addr < state.brk_base {
         return Ok(state.brk_current);
     }
-
-    // Extend brk
     state.brk_current = addr;
     Ok(state.brk_current)
 }
