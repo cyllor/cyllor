@@ -9,7 +9,7 @@ use crate::syscall::{SyscallResult, ENOMEM, EINVAL};
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-const KERNEL_HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+const KERNEL_HEAP_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
 #[repr(align(4096))]
 struct HeapSpace(UnsafeCell<[u8; KERNEL_HEAP_SIZE]>);

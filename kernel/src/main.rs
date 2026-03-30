@@ -71,8 +71,11 @@ unsafe extern "C" fn _start() -> ! {
         }
     }
 
+    // Also create the test ELF as fallback
+    create_test_elf();
+
     // Spawn init process
-    let init_paths = ["/bin/hello", "/sbin/init", "/bin/init", "/bin/sh"];
+    let init_paths = ["/sbin/init", "/bin/bash", "/bin/sh", "/bin/hello"];
     for path in &init_paths {
         match sched::spawn_user_process(path, &[path.as_bytes()], &[
             b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -258,46 +261,59 @@ fn create_test_elf() {
     log::info!("Test ELF /bin/hello created");
 }
 
-/// Load critical files from ext4 rootfs into the in-memory VFS
+/// Load specific files from ext4 rootfs into the in-memory VFS on demand
 fn load_rootfs_to_vfs() {
-    let critical_dirs = [
-        "/bin", "/sbin", "/lib", "/lib64",
-        "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64",
-        "/etc",
+    // Only load specific binaries needed for init, not everything
+    let critical_files = [
+        "/sbin/init",
+        "/bin/bash",
+        "/bin/sh",
+        "/lib/ld-linux-aarch64.so.1",
+        "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libdl.so.2",
+        "/lib/aarch64-linux-gnu/libpthread.so.0",
+        "/lib/aarch64-linux-gnu/libm.so.6",
+        "/usr/bin/weston",
+        "/usr/bin/startxfce4",
+        "/usr/bin/xfce4-session",
     ];
 
-    for dir in &critical_dirs {
-        match fs::ext4::list_dir(dir) {
-            Ok(entries) => {
-                // Ensure directory exists in VFS
-                let _ = fs::mkdirat(-1, dir, 0o755);
-                for (name, ino, ftype) in &entries {
-                    if name == "." || name == ".." { continue; }
-                    let full_path = alloc::format!("{}/{}", dir, name);
-                    if *ftype == 2 {
-                        // Directory
-                        let _ = fs::mkdirat(-1, &full_path, 0o755);
-                    } else if *ftype == 1 {
-                        // Regular file — load into VFS
-                        if let Ok(data) = fs::ext4::read_file(&full_path) {
-                            let parent = fs::vfs::resolve_path(dir);
-                            if let Ok(parent_node) = parent {
-                                let mut pn = parent_node.lock();
-                                let mut inode = fs::vfs::Inode::new_file(0o755);
-                                inode.data = data;
-                                inode.size = inode.data.len();
-                                pn.children.insert(
-                                    alloc::string::ToString::to_string(name.as_str()),
-                                    alloc::sync::Arc::new(spin::Mutex::new(inode)),
-                                );
-                            }
-                        }
-                    }
-                }
-                log::debug!("Loaded {} into VFS", dir);
-            }
-            Err(_) => {}
+    for path in &critical_files {
+        // Ensure parent directories exist
+        if let Some(parent_path) = path.rsplit_once('/') {
+            let dir = parent_path.0;
+            ensure_vfs_dir(dir);
         }
+
+        match fs::ext4::read_file(path) {
+            Ok(data) => {
+                let (dir, name) = path.rsplit_once('/').unwrap();
+                if let Ok(parent_node) = fs::vfs::resolve_path(dir) {
+                    let mut pn = parent_node.lock();
+                    let mut inode = fs::vfs::Inode::new_file(0o755);
+                    let size = data.len();
+                    inode.data = data;
+                    inode.size = size;
+                    pn.children.insert(
+                        alloc::string::ToString::to_string(name),
+                        alloc::sync::Arc::new(spin::Mutex::new(inode)),
+                    );
+                    log::debug!("Loaded {} ({} KiB)", path, size / 1024);
+                }
+            }
+            Err(_) => {} // File not found in ext4, skip
+        }
+    }
+}
+
+fn ensure_vfs_dir(path: &str) {
+    let parts: alloc::vec::Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut current = alloc::string::String::new();
+    for part in parts {
+        current.push('/');
+        current.push_str(part);
+        let _ = fs::mkdirat(-1, &current, 0o755);
     }
 }
 
