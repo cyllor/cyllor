@@ -186,6 +186,25 @@ fn walk_user_page_table(ttbr0: u64, va: u64, hhdm: u64) -> Option<u64> {
     Some(page_phys | (va & 0xFFF))
 }
 
+pub fn sys_getdents64(fd: u32, dirp: u64, count: u32) -> SyscallResult {
+    // Return 0 = end of directory
+    Ok(0)
+}
+
+pub fn sys_readlinkat(dirfd: i32, pathname: u64, buf: u64, bufsiz: u32) -> SyscallResult {
+    let path = unsafe { cstr_from_user(pathname)? };
+    // /proc/self/exe -> return the running program name
+    if path == "/proc/self/exe" {
+        let exe = b"/bin/hello";
+        let len = (exe.len()).min(bufsiz as usize);
+        unsafe {
+            core::ptr::copy_nonoverlapping(exe.as_ptr(), buf as *mut u8, len);
+        }
+        return Ok(len);
+    }
+    Err(super::EINVAL)
+}
+
 unsafe fn cstr_from_user(ptr: u64) -> Result<&'static str, i32> {
     if ptr == 0 {
         return Err(EINVAL);

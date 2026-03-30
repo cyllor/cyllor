@@ -50,6 +50,20 @@ else
 		-no-reboot
 endif
 
+# Run with rootfs disk (headless)
+run-rootfs: image
+ifeq ($(ARCH),aarch64)
+	qemu-system-aarch64 \
+		-M virt -cpu cortex-a72 -m 1G -smp 4 \
+		-serial stdio \
+		-bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+		-drive file=$(IMG),format=raw \
+		-drive file=target/rootfs.img,format=raw,if=none,id=rootfs \
+		-device virtio-blk-device,drive=rootfs \
+		-device ramfb \
+		-no-reboot -display none
+endif
+
 # Run with GUI window (shows framebuffer)
 run-gui: image
 ifeq ($(ARCH),aarch64)
@@ -58,6 +72,8 @@ ifeq ($(ARCH),aarch64)
 		-serial stdio \
 		-bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
 		-drive file=$(IMG),format=raw \
+		-drive file=target/rootfs.img,format=raw,if=none,id=rootfs \
+		-device virtio-blk-device,drive=rootfs \
 		-device ramfb \
 		-device qemu-xhci -device usb-kbd -device usb-mouse \
 		-no-reboot

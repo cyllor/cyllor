@@ -79,6 +79,28 @@ mod nr {
     pub const CLOCK_NANOSLEEP: u64 = 115;
     pub const SET_ROBUST_LIST: u64 = 99;
     pub const GET_ROBUST_LIST: u64 = 100;
+    // Additional glibc-required syscalls
+    pub const RSEQ: u64 = 293;
+    pub const CLONE3: u64 = 435;
+    pub const PRCTL: u64 = 167;
+    pub const ARCH_PRCTL: u64 = 167; // same as PRCTL on aarch64
+    pub const UNAME: u64 = 160;
+    pub const GETDENTS64: u64 = 61;
+    pub const READLINKAT: u64 = 78;
+    pub const ACCESS: u64 = 1039; // faccessat on aarch64
+    pub const FACCESSAT: u64 = 48;
+    pub const FACCESSAT2: u64 = 439;
+    pub const FSTATFS: u64 = 44;
+    pub const STATFS: u64 = 43;
+    pub const MREMAP: u64 = 216;
+    pub const MADVISE: u64 = 233;
+    pub const SIGALTSTACK: u64 = 132;
+    pub const GETSOCKNAME: u64 = 204;
+    pub const GETPEERNAME: u64 = 205;
+    pub const SHMGET: u64 = 194;
+    pub const SHMAT: u64 = 196;
+    pub const SHMCTL: u64 = 195;
+    pub const SHMDT: u64 = 197;
 }
 
 /// Handle a syscall from userspace
@@ -157,9 +179,24 @@ pub fn handle(frame: &mut TrapFrame) {
 
         nr::GETRANDOM => mm::sys_getrandom(args[0], args[1], args[2] as u32),
         nr::PRLIMIT64 => process::sys_prlimit64(args[0] as i32, args[1] as u32, args[2], args[3]),
-        nr::SET_ROBUST_LIST => Ok(0), // stub
+        nr::SET_ROBUST_LIST => Ok(0),
         nr::GET_ROBUST_LIST => Err(ENOSYS),
         nr::MEMFD_CREATE => mm::sys_memfd_create(args[0], args[1] as u32),
+
+        // glibc required stubs
+        nr::RSEQ => Err(ENOSYS), // glibc handles ENOSYS gracefully
+        nr::CLONE3 => Err(ENOSYS), // falls back to clone
+        nr::PRCTL => process::sys_prctl(args[0] as i32, args[1], args[2], args[3], args[4]),
+        nr::UNAME => process::sys_uname(args[0]),
+        nr::GETDENTS64 => fs::sys_getdents64(args[0] as u32, args[1], args[2] as u32),
+        nr::READLINKAT => fs::sys_readlinkat(args[0] as i32, args[1], args[2], args[3] as u32),
+        nr::FACCESSAT | nr::FACCESSAT2 => Ok(0), // pretend everything is accessible
+        nr::FSTATFS | nr::STATFS => process::sys_statfs(args[0], args[1]),
+        nr::MREMAP => mm::sys_mremap(args[0], args[1], args[2], args[3] as u32, args[4]),
+        nr::MADVISE => Ok(0), // advisory, ignore
+        nr::SIGALTSTACK => Ok(0), // stub
+        nr::GETSOCKNAME => Ok(0),
+        nr::GETPEERNAME => Err(ENOTSOCK),
 
         _ => {
             log::warn!("Unimplemented syscall: {syscall_nr}");

@@ -43,11 +43,38 @@ unsafe extern "C" fn _start() -> ! {
     #[cfg(target_arch = "aarch64")]
     arch::aarch64::start_secondary_cpus();
 
-    create_test_elf();
+    // Probe VirtIO devices
+    let hhdm = arch::aarch64::hhdm_offset();
+    drivers::virtio::block::probe(hhdm);
 
-    match sched::spawn_user_process("/bin/hello", &[b"hello"], &[b"PATH=/bin"]) {
-        Ok(pid) => log::info!("User process spawned: PID {pid}"),
-        Err(e) => log::error!("Failed to spawn: {e}"),
+    // Try to mount ext4 from VirtIO block device
+    match fs::ext4::mount() {
+        Ok(()) => {
+            log::info!("ext4 root filesystem mounted");
+            // Load ext4 files into VFS
+            load_rootfs_to_vfs();
+        }
+        Err(e) => {
+            log::warn!("ext4 mount failed: {e} (using test ELF)");
+            create_test_elf();
+        }
+    }
+
+    // Spawn init process
+    let init_paths = ["/sbin/init", "/bin/init", "/bin/sh", "/bin/hello"];
+    for path in &init_paths {
+        match sched::spawn_user_process(path, &[path.as_bytes()], &[
+            b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            b"HOME=/root",
+            b"TERM=linux",
+            b"DISPLAY=:0",
+        ]) {
+            Ok(pid) => {
+                log::info!("Init process: '{}' PID {pid}", path);
+                break;
+            }
+            Err(_) => continue,
+        }
     }
 
     log::info!("Cyllor OS boot complete - {} CPUs", num_cpus);
@@ -218,6 +245,49 @@ fn create_test_elf() {
         );
     }
     log::info!("Test ELF /bin/hello created");
+}
+
+/// Load critical files from ext4 rootfs into the in-memory VFS
+fn load_rootfs_to_vfs() {
+    let critical_dirs = [
+        "/bin", "/sbin", "/lib", "/lib64",
+        "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64",
+        "/etc",
+    ];
+
+    for dir in &critical_dirs {
+        match fs::ext4::list_dir(dir) {
+            Ok(entries) => {
+                // Ensure directory exists in VFS
+                let _ = fs::mkdirat(-1, dir, 0o755);
+                for (name, ino, ftype) in &entries {
+                    if name == "." || name == ".." { continue; }
+                    let full_path = alloc::format!("{}/{}", dir, name);
+                    if *ftype == 2 {
+                        // Directory
+                        let _ = fs::mkdirat(-1, &full_path, 0o755);
+                    } else if *ftype == 1 {
+                        // Regular file — load into VFS
+                        if let Ok(data) = fs::ext4::read_file(&full_path) {
+                            let parent = fs::vfs::resolve_path(dir);
+                            if let Ok(parent_node) = parent {
+                                let mut pn = parent_node.lock();
+                                let mut inode = fs::vfs::Inode::new_file(0o755);
+                                inode.data = data;
+                                inode.size = inode.data.len();
+                                pn.children.insert(
+                                    alloc::string::ToString::to_string(name.as_str()),
+                                    alloc::sync::Arc::new(spin::Mutex::new(inode)),
+                                );
+                            }
+                        }
+                    }
+                }
+                log::debug!("Loaded {} into VFS", dir);
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 fn print_hex_early(val: u64) {
