@@ -72,11 +72,13 @@ unsafe extern "C" fn _start() -> ! {
         }
     }
 
-    // Also create the test ELF as fallback
-    create_test_elf();
+    // Create test ELF only if /bin/hello doesn't exist from rootfs
+    if fs::vfs::resolve_path("/bin/hello").is_err() {
+        create_test_elf();
+    }
 
     // Spawn init process
-    let init_paths = ["/bin/hello_dyn", "/sbin/init", "/bin/bash", "/bin/hello"];
+    let init_paths = ["/bin/hello_raw", "/bin/hello", "/bin/hello_dyn", "/bin/bash"];
     for path in &init_paths {
         match sched::spawn_user_process(path, &[path.as_bytes()], &[
             b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -137,6 +139,36 @@ fn run_first_user_process() {
 
     drivers::uart::early_print("Limine L0 copied.\n");
 
+    // WORKAROUND: The page table entries for the interpreter (loaded after the
+    // main ELF) may not be in our L0 table due to a PMM/paging bug.
+    // Re-load interpreter pages directly into the new L0 table.
+    {
+        let sg = sched::SCHEDULER.lock();
+        let t = sg.run_queues[0].front().unwrap();
+        if let Some(ref aspace) = t.address_space {
+            // Check if interp pages exist in our table
+            let our_l0_check = (aspace.root_phys + hhdm) as *const u64;
+            let interp_l0 = unsafe { core::ptr::read_volatile(our_l0_check.add(0xA)) };
+            if interp_l0 == 0 {
+                log::warn!("Interp L0[0xA] missing! Re-mapping interpreter...");
+                // Find the interpreter entry by checking the thread context
+                let interp_base: u64 = 0x0000_0050_0000_0000;
+                // Load the interpreter DIRECTLY into the new merged L0 table
+                let interp_path = "/lib/ld-linux-aarch64.so.1";
+                if let Ok(node) = fs::vfs::resolve_path(interp_path) {
+                    let data = node.lock().data.clone();
+                    if !data.is_empty() {
+                        // Parse ELF and map segments into new_l0_phys
+                        map_interp_to_table(new_l0_phys, &data, interp_base, hhdm);
+                    }
+                } else if let Ok(data) = fs::ext4::read_file(interp_path) {
+                    map_interp_to_table(new_l0_phys, &data, interp_base, hhdm);
+                }
+            }
+        }
+        drop(sg);
+    }
+
     // For user VA ranges (covered by our page table), use OUR entries.
     // For HHDM ranges (covered by Limine), keep Limine's entries.
     // Our user pages are at L0 index 0 (VA 0x0-0x7FFFFFFFFF)
@@ -196,6 +228,52 @@ fn run_first_user_process() {
             }
         }
     }
+
+    // Check our original page table L0 entries
+    {
+        let sg = sched::SCHEDULER.lock();
+        let t = sg.run_queues[0].front().unwrap();
+        if let Some(ref aspace) = t.address_space {
+            log::debug!("Thread root_phys = 0x{:x}", aspace.root_phys);
+            let our = (aspace.root_phys + hhdm) as *const u64;
+            log::debug!("Our L0[0] = 0x{:x}", unsafe { *our.add(0) });
+            log::debug!("Our L0[0xA] = 0x{:x}", unsafe { *our.add(0xA) });
+            log::debug!("Our L0[0xFF] = 0x{:x}", unsafe { *our.add(0xFF) });
+        }
+        drop(sg);
+    }
+
+    // Verify key L0 entries in merged table
+    let verify_l0 = (new_l0_phys + hhdm) as *const u64;
+    log::debug!("Merged L0[0] = 0x{:x}", unsafe { *verify_l0.add(0) });   // code (0x400000)
+    log::debug!("Merged L0[0xA] = 0x{:x}", unsafe { *verify_l0.add(0xA) }); // interp (0x5000000000)
+    log::debug!("Merged L0[0xFF] = 0x{:x}", unsafe { *verify_l0.add(0xFF) }); // stack
+
+    // Verify stack page is mapped
+    let hhdm2 = arch::aarch64::hhdm_offset();
+    let merged_l0 = (new_l0_phys + hhdm2) as *const u64;
+    let stack_l0_idx = (0x7FFFFFFFEu64 >> 27) & 0x1FF;  // L0 index for stack
+    let stack_l0_entry = unsafe { core::ptr::read_volatile(merged_l0.add(0xFF)) };
+    log::debug!("Merged L0[0xFF] (stack) = 0x{:x}", stack_l0_entry);
+
+    // Try to read from the stack address via HHDM to verify data
+    let sched_guard = sched::SCHEDULER.lock();
+    let thread = sched_guard.run_queues[0].front().unwrap();
+    if let Some(ref aspace) = thread.address_space {
+        if let Some(sp_phys) = aspace.translate(user_sp) {
+            let sp_kva = sp_phys + hhdm2;
+            let argc = unsafe { *(sp_kva as *const u64) };
+            log::debug!("Stack verify: sp=0x{:x} phys=0x{:x} argc={}", user_sp, sp_phys, argc);
+            // Read first 24 u64s from sp to see argc+argv+envp+auxv
+            for i in 0..24 {
+                let val = unsafe { *((sp_kva + i * 8) as *const u64) };
+                log::debug!("  sp[{}] = 0x{:x}", i, val);
+            }
+        } else {
+            log::error!("Stack VA 0x{:x} not mapped!", user_sp);
+        }
+    }
+    drop(sched_guard);
 
     log::info!("ERET to EL0: entry=0x{entry:x} sp=0x{user_sp:x}");
 
@@ -283,7 +361,7 @@ fn load_rootfs_to_vfs() {
         "/sbin/init", "/usr/sbin/init",
         "/bin/bash", "/usr/bin/bash",
         "/bin/sh", "/usr/bin/sh",
-        "/bin/hello", "/bin/hello_dyn",
+        "/bin/hello", "/bin/hello_raw", "/bin/hello_dyn",
         "/usr/bin/weston",
         "/usr/bin/startxfce4",
         "/usr/bin/xfce4-session",
@@ -344,6 +422,90 @@ fn ensure_vfs_dir(path: &str) {
         current.push_str(part);
         let _ = fs::mkdirat(-1, &current, 0o755);
     }
+}
+
+/// Map interpreter ELF segments directly into a page table
+fn map_interp_to_table(l0_phys: u64, data: &[u8], base: u64, hhdm: u64) {
+    use crate::arch::aarch64::paging::PageFlags;
+    use crate::mm::mmap::map_page_in_ttbr0;
+
+    if data.len() < 64 { return; }
+
+    let ehdr = unsafe { &*(data.as_ptr() as *const sched::elf::Elf64Ehdr) };
+    if ehdr.e_ident[0..4] != [0x7f, b'E', b'L', b'F'] { return; }
+
+    let phdrs = unsafe {
+        core::slice::from_raw_parts(
+            data.as_ptr().add(ehdr.e_phoff as usize) as *const sched::elf::Elf64Phdr,
+            ehdr.e_phnum as usize,
+        )
+    };
+
+    // Find min vaddr for load bias
+    let mut min_vaddr = u64::MAX;
+    for phdr in phdrs {
+        if phdr.p_type == 1 && phdr.p_vaddr < min_vaddr {
+            min_vaddr = phdr.p_vaddr;
+        }
+    }
+    let load_bias = base - (min_vaddr & !0xFFF);
+
+    for phdr in phdrs {
+        if phdr.p_type != 1 { continue; } // PT_LOAD only
+        let vaddr = phdr.p_vaddr + load_bias;
+        let aligned_start = vaddr & !0xFFF;
+        let aligned_end = (vaddr + phdr.p_memsz + 0xFFF) & !0xFFF;
+
+        let writable = phdr.p_flags & 2 != 0;
+        let executable = phdr.p_flags & 1 != 0;
+        let flags = PageFlags {
+            readable: true, writable, executable, user: true, device: false,
+        };
+
+        let mut offset = 0u64;
+        while aligned_start + offset < aligned_end {
+            let page_va = aligned_start + offset;
+            let phys = mm::pmm::alloc_page().unwrap() as u64;
+            unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096); }
+
+            // Copy file data for this page
+            if page_va >= vaddr && phdr.p_filesz > 0 {
+                let offset_in_seg = (page_va - vaddr) as usize;
+                if offset_in_seg < phdr.p_filesz as usize {
+                    let file_start = phdr.p_offset as usize + offset_in_seg;
+                    let remaining = (phdr.p_filesz as usize) - offset_in_seg;
+                    let copy_len = remaining.min(4096);
+                    if file_start + copy_len <= data.len() {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                data[file_start..].as_ptr(),
+                                (phys + hhdm) as *mut u8,
+                                copy_len,
+                            );
+                        }
+                    }
+                }
+            } else if page_va < vaddr && page_va + 4096 > vaddr && phdr.p_filesz > 0 {
+                // Page straddles the segment start
+                let skip = (vaddr - page_va) as usize;
+                let copy_len = (4096 - skip).min(phdr.p_filesz as usize);
+                let file_start = phdr.p_offset as usize;
+                if file_start + copy_len <= data.len() {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            data[file_start..].as_ptr(),
+                            (phys + hhdm + skip as u64) as *mut u8,
+                            copy_len,
+                        );
+                    }
+                }
+            }
+
+            map_page_in_ttbr0(l0_phys, page_va, phys, flags, hhdm);
+            offset += 4096;
+        }
+    }
+    log::info!("Interpreter re-mapped into merged page table");
 }
 
 fn print_hex_early(val: u64) {

@@ -94,6 +94,9 @@ impl AddressSpace {
                 let new_table = alloc_table_page().ok_or(())?;
                 let new_entry = new_table | PTE_VALID | PTE_TABLE;
                 unsafe { ptr::write_volatile(table_virt.add(indices[level]), new_entry); }
+                if level == 0 {
+                    log::debug!("paging: created L0[{}] = 0x{:x} for virt 0x{:x}", indices[0], new_entry, virt);
+                }
                 table_phys = new_table;
             } else {
                 table_phys = entry & 0x0000_FFFF_FFFF_F000;
@@ -121,6 +124,7 @@ impl AddressSpace {
     /// Map anonymous pages (allocate physical memory)
     pub fn map_anon(&self, virt_start: u64, size: usize, flags: PageFlags) -> Result<(), ()> {
         let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+        log::debug!("map_anon: virt=0x{:x} pages={} root=0x{:x}", virt_start, pages, self.root_phys);
         for i in 0..pages {
             let phys = pmm::alloc_page().ok_or(())? as u64;
             // Zero the page

@@ -1,6 +1,6 @@
 pub mod pmm;
 mod heap;
-mod mmap;
+pub mod mmap;
 
 use core::cell::UnsafeCell;
 use linked_list_allocator::LockedHeap;

@@ -119,7 +119,7 @@ pub fn do_brk(addr: usize) -> SyscallResult {
 }
 
 /// Map a single page in the active 4-level page table (TTBR0)
-fn map_page_in_ttbr0(l0_phys: u64, virt: u64, phys: u64, flags: PageFlags, hhdm: u64) {
+pub fn map_page_in_ttbr0(l0_phys: u64, virt: u64, phys: u64, flags: PageFlags, hhdm: u64) {
     let indices = [
         ((virt >> 39) & 0x1FF) as usize,
         ((virt >> 30) & 0x1FF) as usize,

@@ -34,34 +34,34 @@ const AT_EXECFN: u64 = 31;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct Elf64Ehdr {
-    e_ident: [u8; 16],
-    e_type: u16,
-    e_machine: u16,
-    e_version: u32,
-    e_entry: u64,
-    e_phoff: u64,
-    e_shoff: u64,
-    e_flags: u32,
-    e_ehsize: u16,
-    e_phentsize: u16,
-    e_phnum: u16,
-    e_shentsize: u16,
-    e_shnum: u16,
-    e_shstrndx: u16,
+pub struct Elf64Ehdr {
+    pub e_ident: [u8; 16],
+    pub e_type: u16,
+    pub e_machine: u16,
+    pub e_version: u32,
+    pub e_entry: u64,
+    pub e_phoff: u64,
+    pub e_shoff: u64,
+    pub e_flags: u32,
+    pub e_ehsize: u16,
+    pub e_phentsize: u16,
+    pub e_phnum: u16,
+    pub e_shentsize: u16,
+    pub e_shnum: u16,
+    pub e_shstrndx: u16,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct Elf64Phdr {
-    p_type: u32,
-    p_flags: u32,
-    p_offset: u64,
-    p_vaddr: u64,
-    p_paddr: u64,
-    p_filesz: u64,
-    p_memsz: u64,
-    p_align: u64,
+pub struct Elf64Phdr {
+    pub p_type: u32,
+    pub p_flags: u32,
+    pub p_offset: u64,
+    pub p_vaddr: u64,
+    pub p_paddr: u64,
+    pub p_filesz: u64,
+    pub p_memsz: u64,
+    pub p_align: u64,
 }
 
 pub struct ElfLoadResult {
@@ -187,7 +187,10 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
                     let ld_result = load_interp(&interp_data, aspace, ld_base)?;
                     interp_base = ld_base;
                     final_entry = ld_result.entry;
-                    log::info!("Loaded interpreter at 0x{:x}, entry=0x{:x}", ld_base, ld_result.entry);
+                    let h = crate::arch::aarch64::hhdm_offset();
+                    let l0p = (aspace.root_phys + h) as *const u64;
+                    let l0a = unsafe { core::ptr::read_volatile(l0p.add(0xA)) };
+                    log::info!("VFS interp: L0[0xA]=0x{:x} entry=0x{:x}", l0a, ld_result.entry);
                 }
             }
             Err(_) => {
@@ -198,6 +201,11 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
                         let ld_result = load_interp(&interp_data, aspace, ld_base)?;
                         interp_base = ld_base;
                         final_entry = ld_result.entry;
+                        // Verify the interp pages are actually mapped
+                        let hhdm_off = crate::arch::aarch64::hhdm_offset();
+                        let l0 = (aspace.root_phys + hhdm_off) as *const u64;
+                        let l0_a = unsafe { core::ptr::read_volatile(l0.add(0xA)) };
+                        log::info!("After load_interp: L0[0xA] = 0x{:x}", l0_a);
                         log::info!("Loaded interpreter at 0x{:x}, entry=0x{:x}", ld_base, ld_result.entry);
                     }
                     Err(_) => {
@@ -207,6 +215,9 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
             }
         }
     }
+
+    log::debug!("ELF load: entry=0x{:x} phdr=0x{:x} phent={} phnum={} interp_base=0x{:x} brk=0x{:x} bias=0x{:x}",
+        final_entry, phdr_addr, ehdr.e_phentsize, ehdr.e_phnum, interp_base, brk_start, load_bias);
 
     Ok(ElfLoadResult {
         entry: final_entry,
@@ -374,6 +385,7 @@ fn load_interp(data: &[u8], aspace: &AddressSpace, base: u64) -> Result<InterpRe
             let aligned_end = (vaddr + phdr.p_memsz + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
             let map_size = (aligned_end - aligned_start) as usize;
 
+            log::debug!("interp PT_LOAD: vaddr=0x{:x} size=0x{:x} flags=0x{:x}", aligned_start, map_size, phdr.p_flags);
             let flags = phdr_to_pageflags(phdr.p_flags);
             aspace.map_anon(aligned_start, map_size, flags)
                 .map_err(|_| "Failed to map interp segment")?;
