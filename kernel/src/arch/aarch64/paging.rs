@@ -90,12 +90,18 @@ impl AddressSpace {
             let entry = unsafe { ptr::read_volatile(table_virt.add(indices[level])) };
 
             if entry & PTE_VALID == 0 {
-                // Allocate new table
                 let new_table = alloc_table_page().ok_or(())?;
+                if new_table == self.root_phys {
+                    // PMM returned the root table page — BUG!
+                    return Err(());
+                }
                 let new_entry = new_table | PTE_VALID | PTE_TABLE;
                 unsafe { ptr::write_volatile(table_virt.add(indices[level]), new_entry); }
-                if level == 0 {
-                    log::debug!("paging: created L0[{}] = 0x{:x} for virt 0x{:x}", indices[0], new_entry, virt);
+                // Verify write
+                let verify = unsafe { ptr::read_volatile(table_virt.add(indices[level])) };
+                if verify != new_entry {
+                    crate::drivers::uart::early_print("PAGE TABLE WRITE FAILED!\n");
+                    return Err(());
                 }
                 table_phys = new_table;
             } else {

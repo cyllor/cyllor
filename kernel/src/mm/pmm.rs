@@ -80,6 +80,20 @@ pub fn init() {
 }
 
 #[allow(dead_code)]
+pub fn mark_used(phys_addr: usize) {
+    let mut pmm = PMM.lock();
+    let page = phys_addr / PAGE_SIZE;
+    if page < MAX_PAGES {
+        let idx = page / 64;
+        let bit = page % 64;
+        if pmm.bitmap[idx] & (1u64 << bit) == 0 {
+            // Was free, mark as used
+            pmm.bitmap[idx] |= 1u64 << bit;
+            if pmm.free_pages > 0 { pmm.free_pages -= 1; }
+        }
+    }
+}
+
 pub fn alloc_page() -> Option<usize> {
     PMM.lock().alloc_page()
 }

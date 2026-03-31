@@ -168,7 +168,13 @@ extern "C" fn sync_handler_rust(frame: *mut TrapFrame) {
         _ => {
             let far: u64;
             unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
-            log::error!("Kernel sync: EC=0x{ec:02x} ESR=0x{esr:016x} ELR=0x{elr:016x} FAR=0x{far:016x}");
+            crate::drivers::uart::early_print("!KS ec=");
+            print_dec(ec as u64);
+            crate::drivers::uart::early_print(" far=");
+            print_dec(far);
+            crate::drivers::uart::early_print(" elr=");
+            print_dec(elr);
+            crate::drivers::uart::early_print("\n");
             loop { core::hint::spin_loop(); }
         }
     }
@@ -183,19 +189,7 @@ extern "C" fn lower_sync_handler_rust(frame: *mut TrapFrame) {
     match ec {
         0x15 => {
             // SVC (syscall)
-            let nr = unsafe { (*frame).regs[8] };
             crate::syscall::handle(unsafe { &mut *frame });
-            let ret = unsafe { (*frame).regs[0] };
-            // Log first 20 syscalls
-            static SC_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-            let count = SC_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if count < 200 {
-                crate::drivers::uart::early_print("sc(");
-                print_dec(nr);
-                crate::drivers::uart::early_print(")=");
-                print_dec(ret);
-                crate::drivers::uart::early_print("\n");
-            }
         }
         0x20 | 0x21 => {
             // Instruction Abort from lower EL

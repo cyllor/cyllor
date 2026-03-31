@@ -37,35 +37,49 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> SyscallResult {
 }
 
 pub fn sys_openat(dirfd: i32, pathname: u64, flags: u32, mode: u32) -> SyscallResult {
-    // Read path from user memory via page table walk
+    let mut path_buf = [0u8; 256];
+    let len = read_user_string(pathname, &mut path_buf)?;
+    let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
+    // Fast path: try VFS, fall back to ENOENT
+    let result = crate::fs::openat(dirfd, path, flags, mode);
+    result
+}
+
+/// Read a null-terminated string from user memory, demand-paging as needed
+fn read_user_string(addr: u64, buf: &mut [u8]) -> Result<usize, i32> {
     let ttbr0: u64;
     unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
     let hhdm = crate::arch::aarch64::hhdm_offset();
+    let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
 
-    let mut path_buf = [0u8; 256];
     let mut len = 0;
-    let mut addr = pathname;
-    'outer: while len < 255 {
-        if let Some(pa) = walk_user_page_table(ttbr0, addr, hhdm) {
-            let kva = pa + hhdm;
-            let page_remaining = 4096 - (addr & 0xFFF) as usize;
-            for i in 0..page_remaining.min(255 - len) {
-                let b = unsafe { *((kva + i as u64) as *const u8) };
-                if b == 0 { break 'outer; }
-                path_buf[len] = b;
-                len += 1;
-                addr += 1;
+    let mut uaddr = addr;
+    while len < buf.len() - 1 {
+        let pa = match walk_user_page_table(ttbr0, uaddr, hhdm) {
+            Some(pa) => pa,
+            None => {
+                // Demand-page: allocate and map a zero page
+                let page = uaddr & !0xFFF;
+                let phys = crate::mm::pmm::alloc_page().ok_or(super::ENOMEM)? as u64;
+                unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096); }
+                crate::mm::mmap::map_page_in_ttbr0(
+                    l0_phys, page, phys,
+                    crate::arch::aarch64::paging::PageFlags::USER_RW, hhdm,
+                );
+                match walk_user_page_table(ttbr0, uaddr, hhdm) {
+                    Some(pa) => pa,
+                    None => return Err(super::EFAULT),
+                }
             }
-        } else {
-            break;
-        }
+        };
+        let kva = pa + hhdm;
+        let b = unsafe { *(kva as *const u8) };
+        if b == 0 { break; }
+        buf[len] = b;
+        len += 1;
+        uaddr += 1;
     }
-
-    let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
-    crate::drivers::uart::early_print("open:");
-    crate::drivers::uart::early_print(path);
-    crate::drivers::uart::early_print("\n");
-    crate::fs::openat(dirfd, path, flags, mode)
+    Ok(len)
 }
 
 pub fn sys_close(fd: u32) -> SyscallResult {
@@ -81,7 +95,9 @@ pub fn sys_fstat(fd: u32, statbuf: u64) -> SyscallResult {
 }
 
 pub fn sys_newfstatat(dirfd: i32, pathname: u64, statbuf: u64, flags: u32) -> SyscallResult {
-    let path = unsafe { cstr_from_user(pathname)? };
+    let mut path_buf = [0u8; 256];
+    let len = read_user_string(pathname, &mut path_buf)?;
+    let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
     crate::fs::fstatat(dirfd, path, statbuf, flags)
 }
 
@@ -224,7 +240,7 @@ pub fn print_hex(val: u64) {
 }
 
 /// Walk user page table (TTBR0) to translate VA to PA
-fn walk_user_page_table(ttbr0: u64, va: u64, hhdm: u64) -> Option<u64> {
+pub fn walk_user_page_table(ttbr0: u64, va: u64, hhdm: u64) -> Option<u64> {
     let indices = [
         ((va >> 39) & 0x1FF) as usize,
         ((va >> 30) & 0x1FF) as usize,
@@ -259,7 +275,9 @@ pub fn sys_getdents64(fd: u32, dirp: u64, count: u32) -> SyscallResult {
 }
 
 pub fn sys_readlinkat(dirfd: i32, pathname: u64, buf: u64, bufsiz: u32) -> SyscallResult {
-    let path = unsafe { cstr_from_user(pathname)? };
+    let mut path_buf = [0u8; 256];
+    let len = read_user_string(pathname, &mut path_buf)?;
+    let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
     // /proc/self/exe -> return the running program name
     if path == "/proc/self/exe" {
         let exe = b"/bin/hello";

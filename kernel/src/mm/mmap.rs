@@ -156,11 +156,13 @@ pub fn map_page_in_ttbr0(l0_phys: u64, virt: u64, phys: u64, flags: PageFlags, h
         let entry = unsafe { core::ptr::read_volatile(table_virt.add(indices[level])) };
 
         if entry & 1 == 0 {
-            // Allocate new table
             let new_table = pmm::alloc_page().unwrap() as u64;
             unsafe { core::ptr::write_bytes((new_table + hhdm) as *mut u8, 0, PAGE_SIZE); }
-            let new_entry = new_table | 0x3; // Valid + Table
-            unsafe { core::ptr::write_volatile(table_virt.add(indices[level]), new_entry); }
+            let new_entry = new_table | 0x3;
+            unsafe {
+                core::ptr::write_volatile(table_virt.add(indices[level]), new_entry);
+                core::arch::asm!("dsb ish");
+            }
             table_phys = new_table;
         } else {
             table_phys = entry & 0x0000_FFFF_FFFF_F000;
@@ -170,5 +172,9 @@ pub fn map_page_in_ttbr0(l0_phys: u64, virt: u64, phys: u64, flags: PageFlags, h
     // Write L3 entry
     let l3_virt = (table_phys + hhdm) as *mut u64;
     let l3_entry = (phys & 0x0000_FFFF_FFFF_F000) | pte_flags | 0x3 | (1 << 10); // Valid + Page + AF
-    unsafe { core::ptr::write_volatile(l3_virt.add(indices[3]), l3_entry); }
+    unsafe {
+        core::ptr::write_volatile(l3_virt.add(indices[3]), l3_entry);
+        // Ensure all page table writes are visible
+        core::arch::asm!("dsb ish");
+    }
 }

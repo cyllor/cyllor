@@ -363,7 +363,18 @@ pub fn init() {
 }
 
 pub fn root() -> Arc<Mutex<Inode>> {
-    ROOT.lock().as_ref().unwrap().clone()
+    crate::drivers::uart::early_print("R+");
+    let guard = ROOT.lock();
+    crate::drivers::uart::early_print("a");
+    let opt = guard.as_ref();
+    crate::drivers::uart::early_print("b");
+    let arc = opt.unwrap();
+    crate::drivers::uart::early_print("c");
+    let cloned = arc.clone();
+    crate::drivers::uart::early_print("d");
+    drop(guard);
+    crate::drivers::uart::early_print("-\n");
+    cloned
 }
 
 pub fn current_dir() -> String {

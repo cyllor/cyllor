@@ -78,7 +78,7 @@ unsafe extern "C" fn _start() -> ! {
     }
 
     // Spawn init process
-    let init_paths = ["/bin/hello_raw", "/bin/hello", "/bin/bash"];
+    let init_paths = ["/bin/bash", "/bin/hello_raw"];
     for path in &init_paths {
         match sched::spawn_user_process(path, &[path.as_bytes()], &[
             b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -139,49 +139,73 @@ fn run_first_user_process() {
 
     drivers::uart::early_print("Limine L0 copied.\n");
 
-    // WORKAROUND: The page table entries for the interpreter (loaded after the
-    // main ELF) may not be in our L0 table due to a PMM/paging bug.
-    // Re-load interpreter pages directly into the new L0 table.
+    // Map interpreter directly into merged table (after Limine L0 copy, before L1 merge)
     {
-        let sg = sched::SCHEDULER.lock();
-        let t = sg.run_queues[0].front().unwrap();
-        if let Some(ref aspace) = t.address_space {
-            // Check if interp pages exist in our table
-            let our_l0_check = (aspace.root_phys + hhdm) as *const u64;
-            let interp_l0 = unsafe { core::ptr::read_volatile(our_l0_check.add(0xA)) };
-            if interp_l0 == 0 {
-                log::warn!("Interp L0[0xA] missing! Re-mapping interpreter...");
-                // Find the interpreter entry by checking the thread context
-                let interp_base: u64 = 0x0000_0050_0000_0000;
-                // Load the interpreter DIRECTLY into the new merged L0 table
-                let interp_path = "/lib/ld-linux-aarch64.so.1";
-                if let Ok(node) = fs::vfs::resolve_path(interp_path) {
-                    let data = node.lock().data.clone();
-                    if !data.is_empty() {
-                        // Parse ELF and map segments into new_l0_phys
-                        map_interp_to_table(new_l0_phys, &data, interp_base, hhdm);
-                    }
-                } else if let Ok(data) = fs::ext4::read_file(interp_path) {
-                    map_interp_to_table(new_l0_phys, &data, interp_base, hhdm);
-                }
+        let interp_path = "/lib/ld-linux-aarch64.so.1";
+        let interp_base: u64 = 0x0000_0050_0000_0000;
+        if let Ok(node) = fs::vfs::resolve_path(interp_path) {
+            let data = node.lock().data.clone();
+            if !data.is_empty() {
+                map_interp_to_table(new_l0_phys, &data, interp_base, hhdm);
+                let check = (new_l0_phys + hhdm) as *const u64;
+                let l0a = unsafe { core::ptr::read_volatile(check.add(0xA)) };
+                log::info!("Interp mapped: L0[0xA]=0x{:x}", l0a);
             }
         }
-        drop(sg);
     }
 
-    // For user VA ranges (covered by our page table), use OUR entries.
-    // For HHDM ranges (covered by Limine), keep Limine's entries.
-    // Our user pages are at L0 index 0 (VA 0x0-0x7FFFFFFFFF)
-    // and stack at L0 index 0xFF (VA 0x7F8000000000-0x7FFFFFFFFFF)
+    // Merge user page table entries, preserving HHDM mappings
     for i in 0..512 {
         let our_entry = unsafe { core::ptr::read_volatile(our_l0.add(i)) };
-        if our_entry != 0 {
-            // Use OUR entry — it has our user page mappings
+        if our_entry == 0 { continue; }
+
+        let limine_entry = unsafe { core::ptr::read_volatile(new_l0.add(i) as *const u64) };
+        if limine_entry == 0 {
+            // No conflict — just use our entry
             unsafe { core::ptr::write_volatile(new_l0.add(i), our_entry) };
+        } else {
+            // CONFLICT: both Limine (HHDM) and user have entries at this L0 index
+            // Must merge at L1 level
+            let limine_l1_phys = limine_entry & 0x0000_FFFF_FFFF_F000;
+            let our_l1_phys = our_entry & 0x0000_FFFF_FFFF_F000;
+
+            let new_l1_phys = mm::pmm::alloc_page().unwrap() as u64;
+            let new_l1 = (new_l1_phys + hhdm) as *mut u64;
+            unsafe { core::ptr::write_bytes(new_l1, 0, 4096); }
+
+            // Copy Limine's L1 entries first (HHDM)
+            let limine_l1 = (limine_l1_phys + hhdm) as *const u64;
+            for j in 0..512 {
+                let le = unsafe { core::ptr::read_volatile(limine_l1.add(j)) };
+                if le != 0 {
+                    unsafe { core::ptr::write_volatile(new_l1.add(j), le); }
+                }
+            }
+            // Overlay our user L1 entries — user entries WIN over Limine's
+            // because user code needs to be at these addresses
+            let our_l1 = (our_l1_phys + hhdm) as *const u64;
+            for j in 0..512 {
+                let oe = unsafe { core::ptr::read_volatile(our_l1.add(j)) };
+                if oe != 0 {
+                    // User entry overrides Limine's identity map
+                    unsafe { core::ptr::write_volatile(new_l1.add(j), oe); }
+                }
+            }
+
+            let new_l0_entry = new_l1_phys | 0x3; // valid + table
+            unsafe { core::ptr::write_volatile(new_l0.add(i), new_l0_entry); }
         }
     }
 
-    drivers::uart::early_print("User L0 merged.\n");
+    // Verify critical L0 entries after merge
+    let v_l0 = (new_l0_phys + hhdm) as *const u64;
+    drivers::uart::early_print("PostMerge L0[0]=");
+    print_hex_early(unsafe { *v_l0 });
+    drivers::uart::early_print(" L0[0xA]=");
+    print_hex_early(unsafe { *v_l0.add(0xA) });
+    drivers::uart::early_print(" L0[0xFF]=");
+    print_hex_early(unsafe { *v_l0.add(0xFF) });
+    drivers::uart::early_print("\n");
 
     // Verify the merged mapping
     let verify_l0 = (new_l0_phys + hhdm) as *const u64;
@@ -274,6 +298,19 @@ fn run_first_user_process() {
         }
     }
     drop(sched_guard);
+
+    // Verify interpreter entry point code
+    let ttbr0_check: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0_check) };
+    let hhdm2 = arch::aarch64::hhdm_offset();
+    if let Some(pa) = crate::syscall::fs::walk_user_page_table(ttbr0_check, entry as u64, hhdm2) {
+        let kva = pa + hhdm2;
+        let inst0 = unsafe { *(kva as *const u32) };
+        let inst1 = unsafe { *((kva + 4) as *const u32) };
+        log::info!("Entry code: [{:08x}] [{:08x}]", inst0, inst1);
+    } else {
+        log::error!("Entry point 0x{:x} NOT MAPPED!", entry);
+    }
 
     log::info!("ERET to EL0: entry=0x{entry:x} sp=0x{user_sp:x}");
 
@@ -463,8 +500,17 @@ fn map_interp_to_table(l0_phys: u64, data: &[u8], base: u64, hhdm: u64) {
         };
 
         let mut offset = 0u64;
+        let mut first = true;
         while aligned_start + offset < aligned_end {
             let page_va = aligned_start + offset;
+            if first {
+                drivers::uart::early_print("map_interp va=");
+                print_hex_early(page_va);
+                drivers::uart::early_print(" l0=");
+                print_hex_early(l0_phys);
+                drivers::uart::early_print("\n");
+                first = false;
+            }
             let phys = mm::pmm::alloc_page().unwrap() as u64;
             unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096); }
 

@@ -115,6 +115,20 @@ pub fn handle(frame: &mut TrapFrame) {
         frame.regs[5], // x5
     ];
 
+    // Trace syscalls
+    static SC: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let sc_num = SC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if sc_num < 100 {
+        crate::drivers::uart::early_print("S");
+        // Print syscall number as simple decimal
+        let mut buf = [0u8; 4];
+        buf[0] = b'0' + ((syscall_nr / 100) % 10) as u8;
+        buf[1] = b'0' + ((syscall_nr / 10) % 10) as u8;
+        buf[2] = b'0' + (syscall_nr % 10) as u8;
+        buf[3] = b' ';
+        for &b in &buf { crate::drivers::uart::write_byte(b); }
+    }
+
     let result = match syscall_nr {
         nr::WRITE => fs::sys_write(args[0], args[1], args[2]),
         nr::READ => fs::sys_read(args[0], args[1], args[2]),
