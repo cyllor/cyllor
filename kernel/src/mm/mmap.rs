@@ -69,14 +69,34 @@ pub fn do_mmap(addr: usize, length: usize, prot: u32, flags: u32, fd: i32, offse
     for i in 0..num_pages {
         let virt = (map_addr + i * PAGE_SIZE) as u64;
         let phys = pmm::alloc_page().ok_or(ENOMEM)? as u64;
-
-        // Zero the page via HHDM
-        unsafe {
-            core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, PAGE_SIZE);
-        }
-
-        // Map in the active page table
+        unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, PAGE_SIZE); }
         map_page_in_ttbr0(l0_phys, virt, phys, page_flags, hhdm);
+
+        // For file-backed mappings, copy file data into the page
+        if fd >= 0 {
+            let file_offset = offset as usize + i * PAGE_SIZE;
+            if let Ok(file) = crate::fs::fdtable::get_file(fd as u32) {
+                let mut f = file.lock();
+                let old_off = f.offset;
+                f.offset = file_offset;
+                // Read directly to physical page via HHDM
+                if let Some(ref inode) = f.inode {
+                    let node = inode.lock();
+                    let avail = node.data.len().saturating_sub(file_offset);
+                    let to_copy = PAGE_SIZE.min(avail);
+                    if to_copy > 0 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                node.data[file_offset..].as_ptr(),
+                                (phys + hhdm) as *mut u8,
+                                to_copy,
+                            );
+                        }
+                    }
+                }
+                f.offset = old_off;
+            }
+        }
     }
 
     Ok(map_addr)

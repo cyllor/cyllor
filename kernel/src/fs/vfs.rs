@@ -143,13 +143,8 @@ impl FileObject {
                     let avail = node.data.len().saturating_sub(self.offset);
                     let to_read = count.min(avail);
                     if to_read > 0 {
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                node.data[self.offset..].as_ptr(),
-                                buf as *mut u8,
-                                to_read,
-                            );
-                        }
+                        let src = &node.data[self.offset..self.offset + to_read];
+                        let _ = crate::syscall::fs::copy_to_user(buf, src);
                     }
                     self.offset += to_read;
                     to_read
@@ -278,38 +273,35 @@ impl FileObject {
     }
 
     pub fn stat(&self, statbuf: u64) -> SyscallResult {
-        // struct stat for AArch64 Linux
-        // Fill with reasonable defaults
-        let stat_ptr = statbuf as *mut u8;
-        unsafe {
-            core::ptr::write_bytes(stat_ptr, 0, 128); // zero out
-            // st_mode at offset 16
-            let mode: u32 = if let Some(ref inode) = self.inode {
-                let node = inode.lock();
-                let type_bits = match node.itype {
-                    InodeType::File => 0o100000,
-                    InodeType::Directory => 0o040000,
-                    InodeType::CharDevice => 0o020000,
-                    _ => 0o100000,
-                };
-                type_bits | node.mode
-            } else {
-                match self.ftype {
-                    FileType::Pipe => 0o010000 | 0o600,
-                    _ => 0o100000 | 0o644,
-                }
+        // Build stat struct in kernel memory, then copy to user
+        let mut buf = [0u8; 128];
+
+        let mode: u32 = if let Some(ref inode) = self.inode {
+            let node = inode.lock();
+            let type_bits = match node.itype {
+                InodeType::File => 0o100000,
+                InodeType::Directory => 0o040000,
+                InodeType::CharDevice => 0o020000,
+                _ => 0o100000,
             };
-            *((statbuf + 16) as *mut u32) = mode;
+            type_bits | node.mode
+        } else {
+            match self.ftype {
+                FileType::Pipe => 0o010000 | 0o600,
+                _ => 0o100000 | 0o644,
+            }
+        };
+        buf[16..20].copy_from_slice(&mode.to_le_bytes());
 
-            // st_size at offset 48
-            let size = if let Some(ref inode) = self.inode {
-                inode.lock().size as u64
-            } else { 0 };
-            *((statbuf + 48) as *mut u64) = size;
+        let size: u64 = if let Some(ref inode) = self.inode {
+            inode.lock().size as u64
+        } else { 0 };
+        buf[48..56].copy_from_slice(&size.to_le_bytes());
 
-            // st_blksize at offset 56
-            *((statbuf + 56) as *mut u64) = 4096;
-        }
+        // st_blksize
+        buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+
+        crate::syscall::fs::copy_to_user(statbuf, &buf).map_err(|_| EINVAL)?;
         Ok(0)
     }
 
@@ -432,18 +424,18 @@ pub fn open_node(inode: Arc<Mutex<Inode>>, flags: u32) -> Result<Arc<Mutex<FileO
 
 pub fn stat_node(inode: &Arc<Mutex<Inode>>, statbuf: u64) -> SyscallResult {
     let node = inode.lock();
-    unsafe {
-        core::ptr::write_bytes(statbuf as *mut u8, 0, 128);
-        let type_bits: u32 = match node.itype {
-            InodeType::File => 0o100000,
-            InodeType::Directory => 0o040000,
-            InodeType::CharDevice => 0o020000,
-            _ => 0o100000,
-        };
-        *((statbuf + 16) as *mut u32) = type_bits | node.mode;
-        *((statbuf + 48) as *mut u64) = node.size as u64;
-        *((statbuf + 56) as *mut u64) = 4096;
-    }
+    let mut buf = [0u8; 128];
+    let type_bits: u32 = match node.itype {
+        InodeType::File => 0o100000,
+        InodeType::Directory => 0o040000,
+        InodeType::CharDevice => 0o020000,
+        _ => 0o100000,
+    };
+    buf[16..20].copy_from_slice(&(type_bits | node.mode).to_le_bytes());
+    buf[48..56].copy_from_slice(&(node.size as u64).to_le_bytes());
+    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+    drop(node);
+    crate::syscall::fs::copy_to_user(statbuf, &buf).map_err(|_| EINVAL)?;
     Ok(0)
 }
 

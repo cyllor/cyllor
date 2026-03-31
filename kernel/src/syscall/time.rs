@@ -12,10 +12,10 @@ pub fn sys_clock_gettime(clk_id: u32, tp: u64) -> SyscallResult {
     let nsecs = ((counter % freq) * 1_000_000_000) / freq;
 
     if tp != 0 {
-        unsafe {
-            *(tp as *mut u64) = secs;
-            *((tp + 8) as *mut u64) = nsecs;
-        }
+        let mut data = [0u8; 16];
+        data[0..8].copy_from_slice(&secs.to_le_bytes());
+        data[8..16].copy_from_slice(&nsecs.to_le_bytes());
+        let _ = super::fs::copy_to_user(tp, &data);
     }
 
     Ok(0)

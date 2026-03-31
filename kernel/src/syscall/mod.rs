@@ -1,4 +1,4 @@
-mod fs;
+pub mod fs;
 mod process;
 mod mm;
 mod net;

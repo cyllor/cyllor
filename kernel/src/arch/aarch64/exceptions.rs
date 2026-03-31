@@ -11,38 +11,33 @@ pub struct TrapFrame {
     pub spsr: u64,       // Saved Program Status Register
 }
 
-// Exception vector table - must be aligned to 2048 bytes
+// Exception vector table
 global_asm!(
     ".align 11",
     "exception_vector_table:",
-
     // Current EL with SP0
-    ".align 7", "b sync_handler",      // Synchronous
-    ".align 7", "b irq_handler",       // IRQ
-    ".align 7", "b unhandled_exception", // FIQ
-    ".align 7", "b unhandled_exception", // SError
-
+    ".align 7", "b sync_handler",
+    ".align 7", "b irq_handler",
+    ".align 7", "b unhandled_exception",
+    ".align 7", "b unhandled_exception",
     // Current EL with SPx
     ".align 7", "b sync_handler",
     ".align 7", "b irq_handler",
     ".align 7", "b unhandled_exception",
     ".align 7", "b unhandled_exception",
-
     // Lower EL using AArch64
     ".align 7", "b lower_sync_handler",
     ".align 7", "b lower_irq_handler",
     ".align 7", "b unhandled_exception",
     ".align 7", "b unhandled_exception",
-
     // Lower EL using AArch32
     ".align 7", "b unhandled_exception",
     ".align 7", "b unhandled_exception",
     ".align 7", "b unhandled_exception",
     ".align 7", "b unhandled_exception",
 
-    // Save registers macro
     ".macro SAVE_REGS",
-    "sub sp, sp, #272",       // 31 regs + sp + elr + spsr = 34 * 8 = 272
+    "sub sp, sp, #272",
     "stp x0, x1, [sp, #0]",
     "stp x2, x3, [sp, #16]",
     "stp x4, x5, [sp, #32]",
@@ -61,10 +56,9 @@ global_asm!(
     "str x30, [sp, #240]",
     "mrs x0, elr_el1",
     "mrs x1, spsr_el1",
-    "stp x0, x1, [sp, #256]",  // elr, spsr
+    "stp x0, x1, [sp, #256]",
     ".endm",
 
-    // Restore registers macro
     ".macro RESTORE_REGS",
     "ldp x0, x1, [sp, #256]",
     "msr elr_el1, x0",
@@ -88,7 +82,6 @@ global_asm!(
     "add sp, sp, #272",
     ".endm",
 
-    // IRQ handler (kernel mode)
     "irq_handler:",
     "SAVE_REGS",
     "mov x0, sp",
@@ -96,7 +89,6 @@ global_asm!(
     "RESTORE_REGS",
     "eret",
 
-    // Sync handler (kernel mode)
     "sync_handler:",
     "SAVE_REGS",
     "mov x0, sp",
@@ -104,7 +96,6 @@ global_asm!(
     "RESTORE_REGS",
     "eret",
 
-    // Lower EL IRQ handler (from userspace)
     "lower_irq_handler:",
     "SAVE_REGS",
     "mov x0, sp",
@@ -112,7 +103,6 @@ global_asm!(
     "RESTORE_REGS",
     "eret",
 
-    // Lower EL Sync handler (syscalls + faults from userspace)
     "lower_sync_handler:",
     "SAVE_REGS",
     "mov x0, sp",
@@ -148,30 +138,18 @@ pub fn ticks() -> u64 {
 #[unsafe(no_mangle)]
 extern "C" fn irq_handler_rust(_frame: *mut TrapFrame) {
     let intid = gic::ack_interrupt();
-
     match intid {
         gic::TIMER_IRQ => {
             timer::reset();
-            let tick = TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-            if tick % 10 == 0 {
-                log::trace!("Timer tick {tick}");
-            }
-            // Phase 3: trigger scheduler here
+            TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             crate::sched::timer_tick();
         }
         gic::SGI_RESCHEDULE => {
-            // IPI for rescheduling
             crate::sched::timer_tick();
         }
-        1020..=1023 => {
-            // Spurious interrupt, ignore
-            return;
-        }
-        _ => {
-            log::warn!("Unhandled IRQ: {intid}");
-        }
+        1020..=1023 => return,
+        _ => {}
     }
-
     gic::end_interrupt(intid);
 }
 
@@ -190,7 +168,7 @@ extern "C" fn sync_handler_rust(frame: *mut TrapFrame) {
         _ => {
             let far: u64;
             unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
-            log::error!("Sync exception: EC=0x{ec:02x} ESR=0x{esr:016x} ELR=0x{elr:016x} FAR=0x{far:016x}");
+            log::error!("Kernel sync: EC=0x{ec:02x} ESR=0x{esr:016x} ELR=0x{elr:016x} FAR=0x{far:016x}");
             loop { core::hint::spin_loop(); }
         }
     }
@@ -198,7 +176,169 @@ extern "C" fn sync_handler_rust(frame: *mut TrapFrame) {
 
 #[unsafe(no_mangle)]
 extern "C" fn lower_sync_handler_rust(frame: *mut TrapFrame) {
-    sync_handler_rust(frame);
+    let esr: u64;
+    unsafe { core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr) };
+    let ec = (esr >> 26) & 0x3F;
+
+    match ec {
+        0x15 => {
+            // SVC (syscall)
+            let nr = unsafe { (*frame).regs[8] };
+            crate::syscall::handle(unsafe { &mut *frame });
+            let ret = unsafe { (*frame).regs[0] };
+            // Log first 20 syscalls
+            static SC_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let count = SC_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if count < 200 {
+                crate::drivers::uart::early_print("sc(");
+                print_dec(nr);
+                crate::drivers::uart::early_print(")=");
+                print_dec(ret);
+                crate::drivers::uart::early_print("\n");
+            }
+        }
+        0x20 | 0x21 => {
+            // Instruction Abort from lower EL
+            let far: u64;
+            unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
+            if !handle_page_fault(far, false) {
+                let elr = unsafe { (*frame).elr };
+                log::error!("User instruction abort: ELR=0x{elr:016x} FAR=0x{far:016x}");
+                // Kill process
+                loop { core::hint::spin_loop(); }
+            }
+        }
+        0x24 | 0x25 => {
+            // Data Abort from lower EL
+            let far: u64;
+            unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
+            let is_write = (esr >> 6) & 1 != 0;
+            if !handle_page_fault(far, is_write) {
+                let elr = unsafe { (*frame).elr };
+                log::error!("User data abort: ELR=0x{elr:016x} FAR=0x{far:016x} write={is_write}");
+                loop { core::hint::spin_loop(); }
+            }
+            // Successfully handled — return to user and retry the instruction
+        }
+        _ => {
+            let far: u64;
+            unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
+            let elr = unsafe { (*frame).elr };
+            log::error!("User exception: EC=0x{ec:02x} ELR=0x{elr:016x} FAR=0x{far:016x}");
+            loop { core::hint::spin_loop(); }
+        }
+    }
+}
+
+fn print_dec(val: u64) {
+    if val > 0x7FFF_FFFF_FFFF_0000 {
+        // Negative (error code)
+        crate::drivers::uart::early_print("-");
+        let neg = (-(val as i64)) as u64;
+        print_dec(neg);
+        return;
+    }
+    if val >= 0x1000 {
+        // Print as hex for large values
+        crate::drivers::uart::early_print("0x");
+        for i in (0..16).rev() {
+            let nibble = ((val >> (i * 4)) & 0xF) as u8;
+            if nibble != 0 || i < 8 {
+                let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+                crate::drivers::uart::write_byte(c);
+            }
+        }
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut n = val;
+    let mut i = 19;
+    loop {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 { break; }
+        if i == 0 { break; }
+        i -= 1;
+    }
+    for &b in &buf[i..] {
+        crate::drivers::uart::write_byte(b);
+    }
+}
+
+/// Handle a page fault by demand-paging: allocate a zero page and map it
+fn handle_page_fault(far: u64, _is_write: bool) -> bool {
+    let page_addr = far & !0xFFF;
+
+    // Reject NULL pointer dereferences and low addresses
+    if far < 0x1000 {
+        return false; // Real NULL deref, crash the process
+    }
+    // Only allow demand paging in valid user regions
+    // Code: 0x400000-0x500000, Stack: 0x7FFF..., mmap: 0x7000..., brk: 0x6000..., interp: 0x5000...
+    if far < 0x400000 && far >= 0x1000 {
+        return false; // Not a valid mapped region
+    }
+
+    // Get current TTBR0
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
+    let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    let hhdm = crate::arch::aarch64::hhdm_offset();
+
+    // Check if the page is already mapped (stale TLB)
+    // Walk the page table
+    let indices = [
+        ((page_addr >> 39) & 0x1FF) as usize,
+        ((page_addr >> 30) & 0x1FF) as usize,
+        ((page_addr >> 21) & 0x1FF) as usize,
+        ((page_addr >> 12) & 0x1FF) as usize,
+    ];
+
+    let mut table_phys = l0_phys;
+    for level in 0..3 {
+        let table_virt = (table_phys + hhdm) as *const u64;
+        let entry = unsafe { core::ptr::read_volatile(table_virt.add(indices[level])) };
+        if entry & 1 == 0 {
+            // Need to allocate — do demand paging
+            break;
+        }
+        table_phys = entry & 0x0000_FFFF_FFFF_F000;
+    }
+
+    static PF_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let count = PF_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if count < 20 {
+        crate::drivers::uart::early_print("pf:");
+        print_dec(page_addr);
+        crate::drivers::uart::early_print("\n");
+    }
+    if count > 10000 {
+        crate::drivers::uart::early_print("Too many page faults!\n");
+        return false;
+    }
+
+    // Allocate and map a zero page
+    let phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p as u64,
+        None => return false,
+    };
+    unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096); }
+
+    let flags = crate::arch::aarch64::paging::PageFlags::USER_RW;
+    crate::mm::mmap::map_page_in_ttbr0(l0_phys, page_addr, phys, flags, hhdm);
+
+    // Flush TLB for this address
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vale1is, {}",
+            "dsb ish",
+            "isb",
+            in(reg) page_addr >> 12,
+        );
+    }
+
+    true
 }
 
 #[unsafe(no_mangle)]

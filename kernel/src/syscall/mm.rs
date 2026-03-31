@@ -18,15 +18,16 @@ pub fn sys_brk(addr: u64) -> SyscallResult {
 }
 
 pub fn sys_getrandom(buf: u64, buflen: u64, _flags: u32) -> SyscallResult {
-    // Simple PRNG for now - not cryptographically secure
-    let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, buflen as usize) };
+    let len = buflen as usize;
+    let mut data = alloc::vec![0u8; len];
     let mut seed: u64 = 0;
     unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) seed) };
-    for byte in slice.iter_mut() {
+    for byte in data.iter_mut() {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         *byte = (seed >> 33) as u8;
     }
-    Ok(buflen as usize)
+    let _ = super::fs::copy_to_user(buf, &data);
+    Ok(len)
 }
 
 pub fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u32, new_addr: u64) -> SyscallResult {

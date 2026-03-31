@@ -78,7 +78,7 @@ unsafe extern "C" fn _start() -> ! {
     }
 
     // Spawn init process
-    let init_paths = ["/bin/hello_raw", "/bin/hello", "/bin/hello_dyn", "/bin/bash"];
+    let init_paths = ["/bin/bash", "/bin/hello_dyn", "/bin/hello", "/bin/hello_raw"];
     for path in &init_paths {
         match sched::spawn_user_process(path, &[path.as_bytes()], &[
             b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",

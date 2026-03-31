@@ -48,50 +48,39 @@ pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> Sys
 
 pub fn sys_uname(buf: u64) -> SyscallResult {
     if buf == 0 { return Err(super::EFAULT); }
-    // struct utsname: 5 fields of 65 bytes each
-    unsafe {
-        core::ptr::write_bytes(buf as *mut u8, 0, 65 * 6);
-        let write_field = |offset: usize, val: &[u8]| {
-            core::ptr::copy_nonoverlapping(val.as_ptr(), (buf + offset as u64) as *mut u8, val.len());
-        };
-        write_field(0, b"Cyllor");           // sysname
-        write_field(65, b"cyllor");          // nodename
-        write_field(130, b"0.1.0");          // release
-        write_field(195, b"Cyllor OS 0.1"); // version
-        write_field(260, b"aarch64");        // machine
-    }
+    let mut data = [0u8; 65 * 6];
+    let write_field = |data: &mut [u8], offset: usize, val: &[u8]| {
+        data[offset..offset + val.len()].copy_from_slice(val);
+    };
+    write_field(&mut data, 0, b"Cyllor");
+    write_field(&mut data, 65, b"cyllor");
+    write_field(&mut data, 130, b"6.1.0");    // Pretend Linux 6.1
+    write_field(&mut data, 195, b"Cyllor OS 0.1");
+    write_field(&mut data, 260, b"aarch64");
+    super::fs::copy_to_user(buf, &data).map_err(|_| super::EFAULT)?;
     Ok(0)
 }
 
 pub fn sys_statfs(fd_or_path: u64, buf: u64) -> SyscallResult {
     if buf != 0 {
-        unsafe {
-            core::ptr::write_bytes(buf as *mut u8, 0, 120);
-            // f_type = EXT4_SUPER_MAGIC
-            *(buf as *mut u64) = 0xEF53;
-            // f_bsize
-            *((buf + 8) as *mut u64) = 4096;
-            // f_blocks
-            *((buf + 16) as *mut u64) = 1024 * 1024;
-            // f_bfree
-            *((buf + 24) as *mut u64) = 512 * 1024;
-            // f_bavail
-            *((buf + 32) as *mut u64) = 512 * 1024;
-            // f_namelen
-            *((buf + 56) as *mut u64) = 255;
-        }
+        let mut data = [0u8; 120];
+        data[0..8].copy_from_slice(&0xEF53u64.to_le_bytes());
+        data[8..16].copy_from_slice(&4096u64.to_le_bytes());
+        data[16..24].copy_from_slice(&(1024 * 1024u64).to_le_bytes());
+        data[24..32].copy_from_slice(&(512 * 1024u64).to_le_bytes());
+        data[32..40].copy_from_slice(&(512 * 1024u64).to_le_bytes());
+        data[56..64].copy_from_slice(&255u64.to_le_bytes());
+        let _ = super::fs::copy_to_user(buf, &data);
     }
     Ok(0)
 }
 
 pub fn sys_prlimit64(pid: i32, resource: u32, new_limit: u64, old_limit: u64) -> SyscallResult {
-    // Stub: return reasonable defaults
     if old_limit != 0 {
-        // struct rlimit { rlim_cur, rlim_max } = 2 * u64
-        unsafe {
-            *(old_limit as *mut u64) = u64::MAX; // soft
-            *((old_limit + 8) as *mut u64) = u64::MAX; // hard
-        }
+        let mut data = [0u8; 16];
+        data[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        data[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        let _ = super::fs::copy_to_user(old_limit, &data);
     }
     Ok(0)
 }

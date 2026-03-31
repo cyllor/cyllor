@@ -37,7 +37,34 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> SyscallResult {
 }
 
 pub fn sys_openat(dirfd: i32, pathname: u64, flags: u32, mode: u32) -> SyscallResult {
-    let path = unsafe { cstr_from_user(pathname)? };
+    // Read path from user memory via page table walk
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
+    let hhdm = crate::arch::aarch64::hhdm_offset();
+
+    let mut path_buf = [0u8; 256];
+    let mut len = 0;
+    let mut addr = pathname;
+    'outer: while len < 255 {
+        if let Some(pa) = walk_user_page_table(ttbr0, addr, hhdm) {
+            let kva = pa + hhdm;
+            let page_remaining = 4096 - (addr & 0xFFF) as usize;
+            for i in 0..page_remaining.min(255 - len) {
+                let b = unsafe { *((kva + i as u64) as *const u8) };
+                if b == 0 { break 'outer; }
+                path_buf[len] = b;
+                len += 1;
+                addr += 1;
+            }
+        } else {
+            break;
+        }
+    }
+
+    let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
+    crate::drivers::uart::early_print("open:");
+    crate::drivers::uart::early_print(path);
+    crate::drivers::uart::early_print("\n");
     crate::fs::openat(dirfd, path, flags, mode)
 }
 
@@ -117,6 +144,75 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> SyscallResult {
 
 pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> SyscallResult {
     crate::fs::fcntl(fd, cmd, arg)
+}
+
+/// Write kernel data to a user virtual address via page table translation
+pub fn copy_to_user(user_addr: u64, data: &[u8]) -> Result<(), i32> {
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
+    let hhdm = crate::arch::aarch64::hhdm_offset();
+
+    let mut offset = 0;
+    while offset < data.len() {
+        let uaddr = user_addr + offset as u64;
+        match walk_user_page_table(ttbr0, uaddr, hhdm) {
+            Some(pa) => {
+                let kva = pa + hhdm;
+                let page_rem = 4096 - (uaddr & 0xFFF) as usize;
+                let chunk = page_rem.min(data.len() - offset);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        data[offset..].as_ptr(),
+                        kva as *mut u8,
+                        chunk,
+                    );
+                }
+                offset += chunk;
+            }
+            None => {
+                // Page fault — try to demand-page it
+                let page_addr = uaddr & !0xFFF;
+                let phys = crate::mm::pmm::alloc_page().ok_or(super::ENOMEM)? as u64;
+                unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096); }
+                let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
+                crate::mm::mmap::map_page_in_ttbr0(
+                    l0_phys, page_addr, phys,
+                    crate::arch::aarch64::paging::PageFlags::USER_RW, hhdm,
+                );
+                // Retry this offset
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read from user virtual address to kernel buffer
+pub fn copy_from_user(user_addr: u64, buf: &mut [u8]) -> Result<(), i32> {
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
+    let hhdm = crate::arch::aarch64::hhdm_offset();
+
+    let mut offset = 0;
+    while offset < buf.len() {
+        let uaddr = user_addr + offset as u64;
+        match walk_user_page_table(ttbr0, uaddr, hhdm) {
+            Some(pa) => {
+                let kva = pa + hhdm;
+                let page_rem = 4096 - (uaddr & 0xFFF) as usize;
+                let chunk = page_rem.min(buf.len() - offset);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        kva as *const u8,
+                        buf[offset..].as_mut_ptr(),
+                        chunk,
+                    );
+                }
+                offset += chunk;
+            }
+            None => return Err(super::EFAULT),
+        }
+    }
+    Ok(())
 }
 
 pub fn print_hex(val: u64) {

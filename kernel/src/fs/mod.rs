@@ -3,7 +3,7 @@ mod tmpfs;
 mod devfs;
 mod procfs;
 mod pipe;
-mod fdtable;
+pub mod fdtable;
 pub mod ext4;
 
 pub use fdtable::*;
