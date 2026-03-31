@@ -36,9 +36,12 @@ pub fn fd_read(fd: u32, buf: u64, count: usize) -> SyscallResult {
 }
 
 pub fn openat(dirfd: i32, path: &str, flags: u32, mode: u32) -> SyscallResult {
-    let node = vfs::resolve_path(path)?;
-    let file = vfs::open_node(node, flags)?;
-    fdtable::alloc_fd(file)
+    // Try VFS first
+    if let Ok(node) = vfs::resolve_path(path) {
+        let file = vfs::open_node(node, flags)?;
+        return fdtable::alloc_fd(file);
+    }
+    Err(crate::syscall::ENOENT)
 }
 
 pub fn close(fd: u32) -> SyscallResult {
