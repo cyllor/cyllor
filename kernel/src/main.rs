@@ -44,9 +44,8 @@ unsafe extern "C" fn _start() -> ! {
     // identity-mapped via TTBR0. TLB flush happens in the trampoline after
     // switch_to_new moves us to the user thread's HHDM kernel stack.
 
-    // Secondary CPUs disabled — GICv2 driver needs work for AP init
-    // #[cfg(target_arch = "aarch64")]
-    // arch::aarch64::start_secondary_cpus();
+    #[cfg(target_arch = "aarch64")]
+    arch::aarch64::start_secondary_cpus();
 
     drivers::uart::early_print("A1\n");
     // Create the console PTY (pty 0) — UART RX bytes flow into this PTY
@@ -112,8 +111,16 @@ unsafe extern "C" fn _start() -> ! {
 
     log::info!("Cyllor OS boot complete - {} CPUs", num_cpus);
 
-    run_first_user_process();
+    // Wait ~2s for AP timer ticks to accumulate, then report
+    log::info!("Waiting 2s for per-CPU tick verification...");
+    for _ in 0..20u32 {
+        arch::PlatformArch::halt(); // ~100ms per tick
+    }
+    log::info!("Per-CPU tick report:");
+    #[cfg(target_arch = "aarch64")]
+    arch::aarch64::dump_per_cpu_ticks();
 
+    run_first_user_process();
     loop { arch::PlatformArch::halt(); }
 }
 

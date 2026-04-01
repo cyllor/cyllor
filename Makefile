@@ -35,7 +35,7 @@ image: build
 run: image
 ifeq ($(ARCH),aarch64)
 	qemu-system-aarch64 \
-		-M virt -cpu cortex-a72 -m 512M -smp 4 \
+		-M virt,gic-version=3 -cpu cortex-a72 -m 512M -smp 4 \
 		-serial stdio \
 		-bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
 		-drive file=$(IMG),format=raw \
@@ -54,7 +54,7 @@ endif
 run-rootfs: image
 ifeq ($(ARCH),aarch64)
 	qemu-system-aarch64 \
-		-M virt -cpu cortex-a72 -m 1G -smp 4 \
+		-M virt,gic-version=3 -cpu cortex-a72 -m 1G -smp 4 \
 		-serial stdio \
 		-bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
 		-drive file=$(IMG),format=raw \
@@ -68,7 +68,7 @@ endif
 run-gui: image
 ifeq ($(ARCH),aarch64)
 	qemu-system-aarch64 \
-		-M virt -cpu cortex-a72 -m 1G -smp 4 \
+		-M virt,gic-version=3 -cpu cortex-a72 -m 1G -smp 4 \
 		-serial stdio \
 		-bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
 		-drive file=$(IMG),format=raw \

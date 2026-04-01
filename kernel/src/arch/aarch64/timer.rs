@@ -29,7 +29,16 @@ pub fn init() {
         core::arch::asm!("msr CNTP_CTL_EL0, {}", in(reg) 1u64);
     }
 
-    log::debug!("Timer: freq={freq} Hz, tick every {ticks} counts ({} ms)", 1000 / TIMER_FREQ_HZ);
+    // Only log from BSP — AP context may not be safe for log
+    if cpu_id() == 0 {
+        log::debug!("Timer: freq={freq} Hz, tick every {ticks} counts ({} ms)", 1000 / TIMER_FREQ_HZ);
+    }
+}
+
+fn cpu_id() -> usize {
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr) };
+    (mpidr & 0xFF) as usize
 }
 
 /// Reset timer for next tick

@@ -65,15 +65,20 @@ pub fn spawn_user_process(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<
     );
 
     // Add to scheduler
-    let mut sched = scheduler::SCHEDULER.lock();
-    if !sched.run_queues.is_empty() {
-        let min_cpu = (0..sched.num_cpus)
-            .min_by_key(|&i| sched.run_queues[i].len())
-            .unwrap_or(0);
-        sched.run_queues[min_cpu].push_back(thread);
+    let target_cpu;
+    {
+        let mut sched = scheduler::SCHEDULER.lock();
+        if sched.run_queues.is_empty() {
+            return Err("Scheduler not initialized");
+        }
+        // Phase 1: all tasks on BSP (CPU 0) only
+        target_cpu = 0;
+        sched.run_queues[target_cpu].push_back(thread);
     }
 
-    log::info!("Spawned user process '{}' (PID {pid}) entry=0x{:x}", path, result.entry);
+    // TODO Phase 3: send_resched_ipi when target != current CPU
+
+    log::info!("Spawned user process '{}' (PID {pid}) entry=0x{:x} on CPU {target_cpu}", path, result.entry);
     Ok(pid)
 }
 

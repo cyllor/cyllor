@@ -79,9 +79,10 @@ unsafe extern "C" fn ap_entry(info: &limine::mp::MpInfo) -> ! {
     let cpu_id = info.extra_argument() as usize;
     crate::drivers::uart::early_print("AP core starting\n");
 
+    super::exceptions::init();
+    super::gic::init_redistributor();
     super::gic::init_cpu_interface();
     super::timer::init();
-    super::exceptions::init();
 
     unsafe {
         core::arch::asm!("msr daifclr, #0xf");
@@ -89,8 +90,8 @@ unsafe extern "C" fn ap_entry(info: &limine::mp::MpInfo) -> ! {
 
     log::info!("CPU {cpu_id} online");
 
+    // Idle loop — timer IRQ handles scheduling
     loop {
         unsafe { core::arch::asm!("wfe") };
-        crate::sched::timer_tick();
     }
 }

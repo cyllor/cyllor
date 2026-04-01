@@ -325,7 +325,30 @@ impl PageFlags {
     }
 }
 
-/// Log TCR/MAIR state set by Limine — do not modify, Limine already configured correctly
+/// Fix MAIR_EL1 so AttrIndx=1 → Device-nGnRnE (0x00) instead of Normal.
+/// Limine sets MAIR=0xFFFF (both index 0 and 1 are Normal=0xFF).
+/// We need: index 0 = 0xFF (Normal WB), index 1 = 0x00 (Device-nGnRnE).
+/// Must be called on EVERY CPU (BSP + all APs) before device MMIO access.
+pub fn fix_mair() {
+    let old_mair: u64;
+    unsafe { core::arch::asm!("mrs {}, MAIR_EL1", out(reg) old_mair) };
+
+    // Keep index 0 (Normal=0xFF), set index 1 to Device-nGnRnE (0x00), rest unchanged
+    let new_mair = (old_mair & !0xFF00) | (0x00 << 8); // index 1 = 0x00 = Device
+
+    unsafe {
+        core::arch::asm!("msr MAIR_EL1, {}", in(reg) new_mair);
+        core::arch::asm!("isb");
+        // Must invalidate TLB since MAIR interpretation changed
+        core::arch::asm!(
+            "dsb ish",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+        );
+    }
+}
+
 pub fn init_mair() {
     let tcr: u64;
     let mair: u64;
@@ -334,4 +357,125 @@ pub fn init_mair() {
         core::arch::asm!("mrs {}, MAIR_EL1", out(reg) mair);
     }
     log::debug!("Limine TCR_EL1=0x{tcr:016x} MAIR_EL1=0x{mair:016x}");
+}
+
+/// Fix Limine's HHDM mapping for device MMIO regions.
+/// Limine maps everything as Normal memory, but device MMIO needs Device-nGnRnE attributes.
+/// For QEMU virt, phys 0-1GB has NO RAM (only devices), so we can just rewrite
+/// the L1 block entry with Device attributes.
+pub fn fix_device_mmio_attrs() {
+    let hhdm = super::hhdm_offset();
+    let ttbr1: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR1_EL1", out(reg) ttbr1) };
+    let l0_phys = ttbr1 & 0x0000_FFFF_FFFF_F000;
+
+    // Walk L0[0] → L1
+    let l0_virt = (l0_phys + hhdm) as *const u64;
+    let l0_entry = unsafe { ptr::read_volatile(l0_virt) };
+    if l0_entry & 0x3 != 0x3 {
+        return; // L0[0] not a table descriptor, can't fix
+    }
+    let l1_phys = l0_entry & 0x0000_FFFF_FFFF_F000;
+    let l1_virt = (l1_phys + hhdm) as *mut u64;
+
+    // L1[0] covers phys 0x0000_0000 - 0x3FFF_FFFF (1GB)
+    // This range on QEMU virt contains GIC (0x0800_0000), UART (0x0900_0000), VirtIO (0x0A00_0000)
+    // No RAM here, so we can safely mark it all as Device memory.
+    let l1_0 = unsafe { ptr::read_volatile(l1_virt) };
+    if l1_0 & 0x1 == 0x1 && l1_0 & 0x2 == 0 {
+        // It's a 1GB block entry — rewrite with Device-nGnRnE attributes
+        // Keep: Valid(0)=1, Block(1)=0, AF(10)=1, phys addr, SH=Inner Shareable
+        // Change: AttrIndx from 0 (Normal) to 1 (Device-nGnRnE)
+        let phys_addr = l1_0 & 0x0000_FFFF_C000_0000; // L1 block alignment: 1GB
+        let new_entry = phys_addr
+            | (1 << 0)     // Valid
+            // bit 1 = 0: block descriptor
+            | PTE_ATTR_DEVICE  // AttrIndx = 1
+            | PTE_SH_INNER    // Inner shareable
+            | (1 << 10)       // AF
+            | PTE_PXN         // No kernel exec from device
+            | PTE_UXN;        // No user exec from device
+        unsafe {
+            ptr::write_volatile(l1_virt, new_entry);
+            core::arch::asm!(
+                "dsb ish",
+                "tlbi vmalle1is",
+                "dsb ish",
+                "isb",
+            );
+        }
+        log::info!("Fixed L1[0]: 0x{l1_0:016x} → 0x{new_entry:016x} (Normal → Device)");
+    }
+}
+
+/// Map a physical device MMIO range into TTBR1 (kernel HHDM space).
+/// Limine's HHDM may not include device MMIO regions — this ensures
+/// GIC, UART etc. are accessible from all CPUs via TTBR1.
+pub fn map_device_mmio(phys_start: u64, size: usize) {
+    let hhdm = super::hhdm_offset();
+    let ttbr1: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR1_EL1", out(reg) ttbr1) };
+    let l0_phys = ttbr1 & 0x0000_FFFF_FFFF_F000;
+
+    let flags = PageFlags::DEVICE;
+    let pte_flags = flags.to_pte();
+    let mut addr = phys_start & !0xFFF;
+    let end = (phys_start + size as u64 + 0xFFF) & !0xFFF;
+
+    while addr < end {
+        let virt = addr + hhdm;
+        // Walk TTBR1 page tables (kernel uses upper VA range, bit 63:48 = 0xFFFF)
+        // For TTBR1, we strip the top bits to get indices
+        let indices = [
+            ((virt >> 39) & 0x1FF) as usize,
+            ((virt >> 30) & 0x1FF) as usize,
+            ((virt >> 21) & 0x1FF) as usize,
+            ((virt >> 12) & 0x1FF) as usize,
+        ];
+
+        let mut table_phys = l0_phys;
+
+        // Walk/create L0 → L1 → L2
+        for level in 0..3 {
+            let table_virt = (table_phys + hhdm) as *mut u64;
+            let entry = unsafe { ptr::read_volatile(table_virt.add(indices[level])) };
+
+            if entry & 0x3 == 0x3 {
+                // Valid table entry — follow it
+                table_phys = entry & 0x0000_FFFF_FFFF_F000;
+            } else if entry & 0x1 == 0x1 && entry & 0x2 == 0 && level > 0 {
+                // Block entry (1GB or 2MB) — page already mapped via block
+                // The address is covered by a large mapping, no need to add L3
+                break;
+            } else {
+                // Not present — allocate a new page table
+                let new_table = pmm::alloc_page().unwrap() as u64;
+                unsafe { ptr::write_bytes((new_table + hhdm) as *mut u8, 0, PAGE_SIZE); }
+                let new_entry = new_table | 0x3; // Valid + Table
+                unsafe { ptr::write_volatile(table_virt.add(indices[level]), new_entry); }
+                table_phys = new_table;
+            }
+        }
+
+        // Check if already mapped (by a block entry above)
+        let l3_virt = (table_phys + hhdm) as *mut u64;
+        let existing = unsafe { ptr::read_volatile(l3_virt.add(indices[3])) };
+        if existing & 1 == 0 {
+            // Not mapped — add L3 page entry
+            let entry = (addr & 0x0000_FFFF_FFFF_F000) | pte_flags | 0x3 | (1 << 10);
+            unsafe { ptr::write_volatile(l3_virt.add(indices[3]), entry); }
+        }
+
+        addr += PAGE_SIZE as u64;
+    }
+
+    // TLB + barrier
+    unsafe {
+        core::arch::asm!(
+            "dsb ish",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+        );
+    }
 }

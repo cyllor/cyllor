@@ -130,7 +130,12 @@ pub fn init() {
             in(reg) tbl,
         );
     }
-    log::debug!("Exception vector table installed");
+    // Only log from BSP
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr) };
+    if mpidr & 0xFF == 0 {
+        log::debug!("Exception vector table installed");
+    }
 }
 
 static TICK_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -145,12 +150,22 @@ extern "C" fn irq_handler_rust(_frame: *mut TrapFrame) {
     match intid {
         gic::TIMER_IRQ => {
             timer::reset();
-            let tick = TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            // (timer tick trace removed for cleanliness)
-            crate::sched::timer_tick();
+            TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // Per-CPU tick counter
+            let cpu = cpu_id();
+            if cpu < 4 {
+                super::PER_CPU_TICKS[cpu].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            // Only BSP runs the scheduler (Phase 1)
+            if cpu == 0 {
+                crate::sched::timer_tick();
+            }
         }
         gic::SGI_RESCHEDULE => {
-            crate::sched::timer_tick();
+            // Phase 1: ignore SGI on APs
+            if cpu_id() == 0 {
+                crate::sched::timer_tick();
+            }
         }
         gic::UART0_IRQ => {
             crate::drivers::uart::handle_rx_interrupt();
@@ -161,15 +176,31 @@ extern "C" fn irq_handler_rust(_frame: *mut TrapFrame) {
     gic::end_interrupt(intid);
 }
 
+fn cpu_id() -> usize {
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr) };
+    (mpidr & 0xFF) as usize
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn lower_irq_handler_rust(_frame: *mut TrapFrame) {
     let intid = gic::ack_interrupt();
     match intid {
         gic::TIMER_IRQ => {
             timer::reset();
-            let tick = TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            // User-mode timer tick
-            crate::sched::timer_tick();
+            TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let cpu = cpu_id();
+            if cpu < 4 {
+                super::PER_CPU_TICKS[cpu].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            if cpu == 0 {
+                crate::sched::timer_tick();
+            }
+        }
+        gic::SGI_RESCHEDULE => {
+            if cpu_id() == 0 {
+                crate::sched::timer_tick();
+            }
         }
         gic::UART0_IRQ => {
             crate::drivers::uart::handle_rx_interrupt();
