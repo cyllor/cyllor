@@ -68,7 +68,7 @@ const UARTIMSC: usize = 0x038;
 const UARTICR:  usize = 0x044;
 
 fn uart_base() -> u64 {
-    UART_BASE + crate::arch::aarch64::hhdm_offset()
+    UART_BASE + crate::arch::hhdm_offset()
 }
 
 fn uart_read(off: usize) -> u32 {

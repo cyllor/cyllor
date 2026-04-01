@@ -214,8 +214,7 @@ pub fn is_inet_fd(fd: u32) -> bool {
 }
 
 fn now_instant() -> Instant {
-    let cntvct: u64;
-    unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) cntvct) };
-    // CNTVCT runs at typically 62.5 MHz on QEMU; convert to milliseconds
-    Instant::from_millis((cntvct / 62500) as i64)
+    let freq = crate::arch::counter_freq().max(1);
+    let cnt = crate::arch::read_counter();
+    Instant::from_millis((cnt * 1000 / freq) as i64)
 }

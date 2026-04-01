@@ -149,8 +149,7 @@ pub fn probe(base: usize, slot: usize, hhdm: u64) -> bool {
     mmio.driver_ok();
 
     // Enable the specific GIC IRQ for this slot (INTID 48 + slot)
-    #[cfg(target_arch = "aarch64")]
-    crate::arch::aarch64::gic::enable_irq(48 + slot as u32);
+    crate::arch::enable_irq(48 + slot as u32);
 
     let dev = VirtioInput {
         mmio,

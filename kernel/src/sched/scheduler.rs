@@ -184,9 +184,9 @@ pub fn schedule() {
             crate::arch::activate_user_page_table(t);
         }
         if is_idle_to_new {
-            unsafe { crate::arch::aarch64::context::switch_to_new_asm(new_ctx); }
+            unsafe { crate::arch::switch_to_new_raw(new_ctx); }
         } else if !old_ctx.is_null() {
-            unsafe { crate::arch::aarch64::context::context_switch_asm(old_ctx, new_ctx); }
+            unsafe { crate::arch::context_switch_raw(old_ctx, new_ctx); }
         }
     }
 }
@@ -213,10 +213,6 @@ pub fn block_current_until(wake_tick: u64) {
 
 /// Send a reschedule SGI to wake an idle CPU.
 pub fn send_resched_ipi(target_cpu: usize) {
-    #[cfg(target_arch = "aarch64")]
-    crate::arch::aarch64::gic::send_sgi(
-        target_cpu,
-        crate::arch::aarch64::gic::SGI_RESCHEDULE,
-    );
+    crate::arch::send_resched_ipi(target_cpu);
 }
 

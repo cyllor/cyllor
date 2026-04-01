@@ -2,9 +2,8 @@ use super::{SyscallResult, EBADF, ENOSYS, EINVAL};
 
 pub fn sys_write(fd: u64, buf: u64, count: u64) -> SyscallResult {
     // Always translate user VA → kernel VA via page table walk
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
-    let hhdm = crate::arch::aarch64::hhdm_offset();
+    let ttbr0 = crate::arch::read_user_page_table_root();
+    let hhdm = crate::arch::hhdm_offset();
 
     // Translate user buffer page-by-page and write
     let mut written = 0usize;
@@ -47,10 +46,8 @@ pub fn sys_openat(dirfd: i32, pathname: u64, flags: u32, mode: u32) -> SyscallRe
 
 /// Read a null-terminated string from user memory, demand-paging as needed
 fn read_user_string(addr: u64, buf: &mut [u8]) -> Result<usize, i32> {
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
-    let hhdm = crate::arch::aarch64::hhdm_offset();
-    let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    let ttbr0 = crate::arch::read_user_page_table_root();
+    let hhdm = crate::arch::hhdm_offset();
 
     let mut len = 0;
     let mut uaddr = addr;
@@ -154,9 +151,8 @@ pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> SyscallResult {
 
 /// Write kernel data to a user virtual address via page table translation
 pub fn copy_to_user(user_addr: u64, data: &[u8]) -> Result<(), i32> {
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
-    let hhdm = crate::arch::aarch64::hhdm_offset();
+    let ttbr0 = crate::arch::read_user_page_table_root();
+    let hhdm = crate::arch::hhdm_offset();
 
     let mut offset = 0;
     while offset < data.len() {
@@ -194,9 +190,8 @@ pub fn copy_to_user(user_addr: u64, data: &[u8]) -> Result<(), i32> {
 
 /// Read from user virtual address to kernel buffer
 pub fn copy_from_user(user_addr: u64, buf: &mut [u8]) -> Result<(), i32> {
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
-    let hhdm = crate::arch::aarch64::hhdm_offset();
+    let ttbr0 = crate::arch::read_user_page_table_root();
+    let hhdm = crate::arch::hhdm_offset();
 
     let mut offset = 0;
     while offset < buf.len() {

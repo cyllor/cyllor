@@ -1,4 +1,4 @@
-// arch/aarch64/context.rs — AArch64 context switch (callee-saved register save/restore)
+// arch/aarch64/context.rs — AArch64 context switch and user-mode entry
 use core::arch::global_asm;
 use crate::sched::process::Context;
 
@@ -52,4 +52,33 @@ pub unsafe fn context_switch(old: &mut Context, new: &Context) {
 /// Restore `new` context and jump into it (first run / idle→thread switch).
 pub unsafe fn switch_to_new(new: &Context) {
     unsafe { switch_to_new_asm(new) }
+}
+
+/// Trampoline: called on a user thread's very first context switch.
+/// x19=entry, x20=SPSR, x21=SP_EL0, x22=TTBR0 (set by scheduler before switch).
+#[unsafe(naked)]
+pub unsafe extern "C" fn return_to_user_trampoline() -> ! {
+    core::arch::naked_asm!(
+        "msr TTBR0_EL1, x22",
+        "isb",
+        "msr ELR_EL1, x19",
+        "msr SPSR_EL1, x20",
+        "msr SPSel, #0",
+        "mov sp, x21",
+        "msr SPSel, #1",
+        "mov x0,  #0", "mov x1,  #0", "mov x2,  #0", "mov x3,  #0",
+        "mov x4,  #0", "mov x5,  #0", "mov x6,  #0", "mov x7,  #0",
+        "mov x8,  #0", "mov x9,  #0", "mov x10, #0", "mov x11, #0",
+        "mov x12, #0", "mov x13, #0", "mov x14, #0", "mov x15, #0",
+        "mov x16, #0", "mov x17, #0", "mov x18, #0", "mov x19, #0",
+        "mov x20, #0", "mov x21, #0", "mov x22, #0", "mov x23, #0",
+        "mov x24, #0", "mov x25, #0", "mov x26, #0", "mov x27, #0",
+        "mov x28, #0", "mov x29, #0", "mov x30, #0",
+        "eret",
+    );
+}
+
+/// Return the address of the user-mode entry trampoline.
+pub fn user_trampoline_addr() -> u64 {
+    return_to_user_trampoline as *const () as u64
 }

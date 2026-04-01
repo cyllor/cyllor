@@ -19,18 +19,13 @@ pub fn do_futex(uaddr: u64, futex_op: i32, val: u32, timeout: u64, uaddr2: u64, 
             if timeout != 0 {
                 let secs = unsafe { *(timeout as *const u64) };
                 let nsecs = unsafe { *((timeout + 8) as *const u64) };
-                let freq: u64;
-                unsafe { core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) freq) };
+                let freq = crate::arch::counter_freq();
                 let ticks = secs * freq + (nsecs * freq) / 1_000_000_000;
-                let start: u64;
-                unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) start) };
-
+                let start = crate::arch::read_counter();
                 loop {
                     let current = unsafe { *(uaddr as *const u32) };
                     if current != val { return Ok(0); }
-                    let now: u64;
-                    unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) now) };
-                    if now - start >= ticks { return Ok(0); }
+                    if crate::arch::read_counter() - start >= ticks { return Ok(0); }
                     core::hint::spin_loop();
                 }
             }

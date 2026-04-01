@@ -20,8 +20,7 @@ pub fn sys_brk(addr: u64) -> SyscallResult {
 pub fn sys_getrandom(buf: u64, buflen: u64, _flags: u32) -> SyscallResult {
     let len = buflen as usize;
     let mut data = alloc::vec![0u8; len];
-    let mut seed: u64 = 0;
-    unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) seed) };
+    let mut seed: u64 = crate::arch::read_counter();
     for byte in data.iter_mut() {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         *byte = (seed >> 33) as u8;

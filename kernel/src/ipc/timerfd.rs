@@ -43,10 +43,8 @@ pub fn settime(fd: u32, flags: i32, new_value: u64, old_value: u64) -> SyscallRe
     let it_value_sec     = unsafe { *((new_value + 16) as *const i64) };
     let it_value_nsec    = unsafe { *((new_value + 24) as *const i64) };
 
-    let freq: u64;
-    unsafe { core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) freq) };
-    let now: u64;
-    unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) now) };
+    let freq = crate::arch::counter_freq();
+    let now = crate::arch::read_counter();
 
     let interval_ns = it_interval_sec as u64 * 1_000_000_000 + it_interval_nsec as u64;
     let value_ns = it_value_sec as u64 * 1_000_000_000 + it_value_nsec as u64;
@@ -77,10 +75,8 @@ pub fn settime(fd: u32, flags: i32, new_value: u64, old_value: u64) -> SyscallRe
 
 pub fn gettime(fd: u32, curr_value: u64) -> SyscallResult {
     if curr_value == 0 { return Ok(0); }
-    let freq: u64;
-    unsafe { core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) freq) };
-    let now: u64;
-    unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) now) };
+    let freq = crate::arch::counter_freq();
+    let now = crate::arch::read_counter();
 
     let timerfds = TIMERFDS.lock();
     if let Some(state) = timerfds.get(&fd) {
@@ -106,8 +102,7 @@ pub fn gettime(fd: u32, curr_value: u64) -> SyscallResult {
 
 /// Called from timer tick to advance all timers
 pub fn tick_all() {
-    let now: u64;
-    unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) now) };
+    let now = crate::arch::read_counter();
     let mut fds = TIMERFDS.lock();
     for state in fds.values_mut() {
         if !state.armed { continue; }

@@ -31,8 +31,7 @@ unsafe extern "C" fn _start() -> ! {
     mm::init();
     fs::init();
 
-    #[cfg(target_arch = "aarch64")]
-    arch::aarch64::paging::init_mair();
+    arch::init_mair();
 
     drivers::framebuffer::init();
     arch::PlatformArch::init_interrupts();
@@ -44,8 +43,7 @@ unsafe extern "C" fn _start() -> ! {
     // identity-mapped via TTBR0. TLB flush happens in the trampoline after
     // switch_to_new moves us to the user thread's HHDM kernel stack.
 
-    #[cfg(target_arch = "aarch64")]
-    arch::aarch64::start_secondary_cpus();
+    arch::start_secondary_cpus();
 
     drivers::uart::early_print("A1\n");
     // Create the console PTY (pty 0) — UART RX bytes flow into this PTY
@@ -54,12 +52,11 @@ unsafe extern "C" fn _start() -> ! {
     log::info!("Console PTY: /dev/pts/{console_pty_id}");
 
     // Enable UART RX interrupt so typed characters reach the PTY
-    #[cfg(target_arch = "aarch64")]
-    arch::aarch64::gic::enable_irq(arch::aarch64::gic::UART0_IRQ);
+    arch::enable_uart_irq();
     drivers::uart::enable_rx_interrupt();
 
     // Probe VirtIO devices
-    let hhdm = arch::aarch64::hhdm_offset();
+    let hhdm = arch::hhdm_offset();
     drivers::virtio::block::probe(hhdm);
 
     // Test disk read
@@ -117,8 +114,7 @@ unsafe extern "C" fn _start() -> ! {
         arch::PlatformArch::halt(); // ~100ms per tick
     }
     log::info!("Per-CPU tick report:");
-    #[cfg(target_arch = "aarch64")]
-    arch::aarch64::dump_per_cpu_ticks();
+    arch::dump_per_cpu_ticks();
 
     run_first_user_process();
     loop { arch::PlatformArch::halt(); }
@@ -143,7 +139,7 @@ fn run_first_user_process() {
 
     // Mask IRQs to prevent re-entrant SCHEDULER lock deadlock.
     // After ERET to EL0, SPSR_EL1=0 restores PSTATE with IRQs enabled.
-    unsafe { core::arch::asm!("msr DAIFSet, #2"); }
+    arch::mask_irqs();
 
     crate::sched::scheduler::schedule();
 
@@ -303,34 +299,6 @@ fn print_hex_early(val: u64) {
     }
 }
 
-core::arch::global_asm!(
-    ".global jump_to_el0",
-    "jump_to_el0:",
-    // x0=entry, x1=spsr, x2=user_sp, x3=ttbr0
-    "msr DAIFSet, #0xf",
-    "msr TTBR0_EL1, x3",
-    "isb",
-    "msr SPSel, #0",
-    "mov sp, x2",
-    "msr SPSel, #1",
-    "msr ELR_EL1, x0",
-    "msr SPSR_EL1, x1",
-    "isb",
-    "mov x0, xzr",
-    "mov x1, xzr",
-    "mov x2, xzr",
-    "mov x3, xzr",
-    "mov x4, xzr",
-    "mov x5, xzr",
-    "mov x6, xzr",
-    "mov x7, xzr",
-    "mov x8, xzr",
-    "eret",
-);
-
-unsafe extern "C" {
-    fn jump_to_el0(entry: u64, spsr: u64, user_sp: u64, ttbr0: u64) -> !;
-}
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {

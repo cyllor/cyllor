@@ -3,7 +3,7 @@
 
 use crate::syscall::{SyscallResult, ENOMEM, EINVAL};
 use crate::mm::pmm;
-use crate::arch::aarch64::paging::{AddressSpace, PageFlags};
+use crate::arch::{AddressSpace, PageFlags};
 use spin::Mutex;
 
 const PAGE_SIZE: usize = 4096;
@@ -54,12 +54,8 @@ pub fn do_mmap(addr: usize, length: usize, prot: u32, flags: u32, fd: i32, offse
         a
     };
 
-    let hhdm = crate::arch::aarch64::hhdm_offset();
-
-    // Get the current TTBR0 (merged Limine + user page table)
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
-    let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    let hhdm = crate::arch::hhdm_offset();
+    let l0_phys = crate::arch::read_user_page_table_root();
 
     // Determine page flags from prot
     let writable = (prot & 2) != 0; // PROT_WRITE
@@ -123,10 +119,8 @@ pub fn do_brk(addr: usize) -> SyscallResult {
         return Ok(state.brk_current);
     }
 
-    let hhdm = crate::arch::aarch64::hhdm_offset();
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
-    let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    let hhdm = crate::arch::hhdm_offset();
+    let l0_phys = crate::arch::read_user_page_table_root();
 
     // Map new pages between current brk and requested addr
     let old = (state.brk_current + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -169,7 +163,7 @@ pub fn map_page_in_ttbr0(l0_phys: u64, virt: u64, phys: u64, flags: PageFlags, h
             let new_entry = new_table | 0x3;
             unsafe {
                 core::ptr::write_volatile(table_virt.add(indices[level]), new_entry);
-                core::arch::asm!("dsb ish");
+                crate::arch::data_sync_barrier();
             }
             table_phys = new_table;
         } else {
@@ -183,6 +177,6 @@ pub fn map_page_in_ttbr0(l0_phys: u64, virt: u64, phys: u64, flags: PageFlags, h
     unsafe {
         core::ptr::write_volatile(l3_virt.add(indices[3]), l3_entry);
         // Ensure all page table writes are visible
-        core::arch::asm!("dsb ish");
+        crate::arch::data_sync_barrier();
     }
 }

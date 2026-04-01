@@ -74,9 +74,48 @@ pub fn read_counter() -> u64 {
     val
 }
 
+/// Read the counter frequency (CNTFRQ_EL0).
+pub fn counter_freq() -> u64 {
+    let freq: u64;
+    unsafe { core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) freq) };
+    freq
+}
+
+/// Read TTBR0_EL1 and return the physical page-table root (ASID bits masked out).
+pub fn read_user_page_table_root() -> u64 {
+    let val: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) val) };
+    val & 0x0000_FFFF_FFFF_F000
+}
+
 /// Switch the user-mode page table (TTBR0_EL1) without a full TLB flush.
 pub fn activate_user_page_table(root_phys: u64) {
     unsafe { core::arch::asm!("msr TTBR0_EL1, {0}", "isb", in(reg) root_phys) };
+}
+
+/// Send a reschedule SGI to the target CPU.
+pub fn send_resched_ipi(target_cpu: usize) {
+    gic::send_sgi(target_cpu, gic::SGI_RESCHEDULE);
+}
+
+/// Enable an interrupt by INTID.
+pub fn enable_irq(intid: u32) {
+    gic::enable_irq(intid);
+}
+
+/// Enable the UART0 receive interrupt.
+pub fn enable_uart_irq() {
+    gic::enable_irq(gic::UART0_IRQ);
+}
+
+/// Disable IRQs so the caller can enter a critical section uninterrupted.
+pub fn mask_irqs() {
+    unsafe { core::arch::asm!("msr DAIFSet, #2") };
+}
+
+/// Inner-shareable data synchronization barrier.
+pub fn data_sync_barrier() {
+    unsafe { core::arch::asm!("dsb ish") };
 }
 
 impl Arch for Aarch64Arch {

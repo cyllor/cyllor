@@ -1,5 +1,4 @@
-#[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::exceptions::TrapFrame;
+use crate::arch::TrapFrame;
 use super::{SyscallResult, ENOSYS, EINVAL};
 
 pub fn sys_rt_sigaction(signum: i32, act: u64, oldact: u64, sigsetsize: u64) -> SyscallResult {

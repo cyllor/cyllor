@@ -204,15 +204,11 @@ pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: u64) -> SyscallResult {
 pub fn epoll_pwait(epfd: i32, events: u64, maxevents: i32, timeout: i32) -> SyscallResult {
     if timeout > 0 {
         // Simple: sleep for timeout ms
-        let freq: u64;
-        unsafe { core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) freq) };
+        let freq = crate::arch::counter_freq();
         let ticks = (timeout as u64 * freq) / 1000;
-        let start: u64;
-        unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) start) };
+        let start = crate::arch::read_counter();
         loop {
-            let now: u64;
-            unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) now) };
-            if now - start >= ticks { break; }
+            if crate::arch::read_counter() - start >= ticks { break; }
             core::hint::spin_loop();
         }
     }

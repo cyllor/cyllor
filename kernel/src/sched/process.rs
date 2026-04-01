@@ -114,7 +114,7 @@ impl Thread {
         let kstack_top = stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
 
         let mut ctx = Context::zero();
-        ctx.x30 = return_to_user_trampoline as *const () as u64;
+        ctx.x30 = crate::arch::user_trampoline_addr();
         ctx.sp = kstack_top;
         ctx.elr = entry;
         ctx.spsr = 0x0; // SPSR EL0t — interrupts enabled, return to EL0
@@ -162,30 +162,3 @@ use alloc::collections::BTreeMap;
 use spin::Mutex;
 pub static PROCESS_TABLE: Mutex<BTreeMap<Pid, Process>> = Mutex::new(BTreeMap::new());
 
-/// Trampoline: called on a user thread's very first context switch.
-/// Reads entry/spsr/sp_el0/ttbr0 from x19-x22 (loaded by the scheduler)
-/// and ERets to EL0.
-#[unsafe(naked)]
-unsafe extern "C" fn return_to_user_trampoline() -> ! {
-    core::arch::naked_asm!(
-        // x19 = ELR (entry point), x20 = SPSR, x21 = SP_EL0, x22 = TTBR0
-        "msr TTBR0_EL1, x22",
-        "isb",
-        "msr ELR_EL1, x19",
-        "msr SPSR_EL1, x20",
-        // Switch to SP_EL0 to set user stack, then back to SP_EL1.
-        "msr SPSel, #0",
-        "mov sp, x21",
-        "msr SPSel, #1",
-        // Zero all GPRs for a clean userspace entry.
-        "mov x0,  #0", "mov x1,  #0", "mov x2,  #0", "mov x3,  #0",
-        "mov x4,  #0", "mov x5,  #0", "mov x6,  #0", "mov x7,  #0",
-        "mov x8,  #0", "mov x9,  #0", "mov x10, #0", "mov x11, #0",
-        "mov x12, #0", "mov x13, #0", "mov x14, #0", "mov x15, #0",
-        "mov x16, #0", "mov x17, #0", "mov x18, #0", "mov x19, #0",
-        "mov x20, #0", "mov x21, #0", "mov x22, #0", "mov x23, #0",
-        "mov x24, #0", "mov x25, #0", "mov x26, #0", "mov x27, #0",
-        "mov x28, #0", "mov x29, #0", "mov x30, #0",
-        "eret",
-    );
-}

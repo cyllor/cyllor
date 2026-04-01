@@ -69,9 +69,7 @@ pub fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> SyscallResult {
         crate::mm::mmap::shm_alloc_addr(size)
     };
 
-    let ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
-    let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    let l0_phys = crate::arch::read_user_page_table_root();
 
     let flags = crate::mm::page_table::PageFlags::USER_RW;
     let pages = (size + 4095) / 4096;

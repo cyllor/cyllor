@@ -6,8 +6,7 @@ mod signal;
 mod time;
 mod io;
 
-#[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::exceptions::TrapFrame;
+use crate::arch::TrapFrame;
 
 // Linux syscall numbers for AArch64
 mod nr {

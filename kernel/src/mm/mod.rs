@@ -14,7 +14,7 @@ pub fn init() {
 
     // Find a contiguous block of physical memory for the heap
     // by scanning the memory map for a large enough USABLE region
-    let hhdm = crate::arch::aarch64::hhdm_offset();
+    let hhdm = crate::arch::hhdm_offset();
     let heap_phys = find_contiguous_region(KERNEL_HEAP_SIZE)
         .expect("Cannot find contiguous region for kernel heap");
 
@@ -43,8 +43,7 @@ pub fn init() {
 
 /// Find a contiguous region of usable physical memory of at least `size` bytes
 fn find_contiguous_region(size: usize) -> Option<usize> {
-    #[cfg(target_arch = "aarch64")]
-    let entries = crate::arch::aarch64::memory_map();
+    let entries = crate::arch::memory_map();
 
     for entry in entries {
         if entry.type_ == limine::memmap::MEMMAP_USABLE {

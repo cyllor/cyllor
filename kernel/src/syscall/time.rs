@@ -1,12 +1,8 @@
 use super::{SyscallResult, EINVAL};
 
 pub fn sys_clock_gettime(clk_id: u32, tp: u64) -> SyscallResult {
-    let counter: u64;
-    let freq: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) counter);
-        core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) freq);
-    }
+    let counter = crate::arch::read_counter();
+    let freq = crate::arch::counter_freq();
 
     let secs = counter / freq;
     let nsecs = ((counter % freq) * 1_000_000_000) / freq;
@@ -29,17 +25,12 @@ pub fn sys_nanosleep(req: u64, rem: u64) -> SyscallResult {
     let secs = unsafe { *(req as *const u64) };
     let nsecs = unsafe { *((req + 8) as *const u64) };
 
-    let freq: u64;
-    unsafe { core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) freq) };
-
+    let freq = crate::arch::counter_freq();
     let ticks_to_wait = secs * freq + (nsecs * freq) / 1_000_000_000;
-
-    let start: u64;
-    unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) start) };
+    let start = crate::arch::read_counter();
 
     loop {
-        let now: u64;
-        unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) now) };
+        let now = crate::arch::read_counter();
         if now - start >= ticks_to_wait {
             break;
         }
@@ -56,6 +47,6 @@ pub fn sys_nanosleep(req: u64, rem: u64) -> SyscallResult {
     Ok(0)
 }
 
-pub fn sys_clock_nanosleep(clk_id: u32, flags: u32, req: u64, rem: u64) -> SyscallResult {
+pub fn sys_clock_nanosleep(_clk_id: u32, _flags: u32, req: u64, rem: u64) -> SyscallResult {
     sys_nanosleep(req, rem)
 }

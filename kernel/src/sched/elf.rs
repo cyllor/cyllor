@@ -125,7 +125,7 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
                     let ld_entry = load_interp(&interp_data, aspace, ld_base)?;
                     interp_base = ld_base;
                     final_entry = ld_entry;
-                    let h = crate::arch::aarch64::hhdm_offset();
+                    let h = crate::arch::hhdm_offset();
                     let l0p = (aspace.root_phys + h) as *const u64;
                     let l0a = unsafe { core::ptr::read_volatile(l0p.add(0xA)) };
                     log::info!("VFS interp: L0[0xA]=0x{:x} entry=0x{:x}", l0a, ld_entry);
@@ -138,7 +138,7 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
                         let ld_entry = load_interp(&interp_data, aspace, ld_base)?;
                         interp_base = ld_base;
                         final_entry = ld_entry;
-                        let hhdm_off = crate::arch::aarch64::hhdm_offset();
+                        let hhdm_off = crate::arch::hhdm_offset();
                         let l0 = (aspace.root_phys + hhdm_off) as *const u64;
                         let l0_a = unsafe { core::ptr::read_volatile(l0.add(0xA)) };
                         log::info!("After load_interp: L0[0xA] = 0x{:x}", l0_a);
