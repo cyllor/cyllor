@@ -97,19 +97,8 @@ pub fn schedule() {
             // Idle thread: just replace, no context to save
             next.state = ThreadState::Running;
 
-            // Switch page table if user thread
-            if next.is_user {
-                unsafe {
-                    core::arch::asm!(
-                        "msr TTBR0_EL1, {0}",
-                        "isb",
-                        "tlbi vmalle1is",
-                        "dsb ish",
-                        "isb",
-                        in(reg) next.context.ttbr0,
-                    );
-                }
-            }
+            // TTBR0 switch happens in the trampoline (return_to_user_trampoline)
+            // Do NOT do it here — tlbi+dsb ish while holding spinlock can stall on SMP.
 
             sched.current[cpu_id] = Some(next);
             // For idle->user, we need to jump to the trampoline
@@ -146,8 +135,6 @@ pub fn schedule() {
     // Do the actual context switch outside the scheduler lock
     if let Some((old_ctx, new_ctx, is_idle_to_user)) = switch_info {
         if is_idle_to_user {
-            // Jump to the new thread's entry (trampoline for user threads)
-            // Load callee-saved regs from new context and jump via ret (x30)
             unsafe {
                 switch_to_new(new_ctx);
             }
@@ -189,7 +176,6 @@ global_asm!(
     "ret",
 
     // switch_to_new: just restore new context registers and jump
-    // Used when there's no old context to save (e.g., idle thread)
     ".global switch_to_new",
     "switch_to_new:",
     "mov x1, x0",   // x0 = new_ctx, move to x1 for consistency

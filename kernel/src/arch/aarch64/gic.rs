@@ -29,6 +29,7 @@ const GICC_EOIR: usize = 0x0010;
 
 // Timer interrupt IDs
 pub const TIMER_IRQ: u32 = 30; // Non-secure EL1 physical timer (PPI 14 = INTID 30)
+pub const UART0_IRQ: u32 = 33; // PL011 UART0 on QEMU virt (SPI 1 = INTID 33)
 pub const SGI_RESCHEDULE: u32 = 1; // SGI for rescheduling IPI
 
 unsafe fn write_reg(base: usize, offset: usize, val: u32) {

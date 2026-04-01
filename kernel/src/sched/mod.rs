@@ -1,5 +1,5 @@
-mod process;
-mod scheduler;
+pub mod process;
+pub mod scheduler;
 pub mod cpu;
 pub mod elf;
 
@@ -48,6 +48,11 @@ pub fn spawn_user_process(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<
 
     // Set up user stack
     let sp = elf::setup_user_stack(&aspace, result.stack_top, argv, envp, &result)?;
+
+    // Initialize brk from ELF brk_start
+    crate::mm::mmap::set_brk_base(result.brk_start as usize);
+
+    // (debug address checks removed)
 
     // Create thread with userspace context
     let pid = process::alloc_pid();

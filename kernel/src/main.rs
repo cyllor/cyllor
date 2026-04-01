@@ -40,8 +40,24 @@ unsafe extern "C" fn _start() -> ! {
     let num_cpus = arch::cpu_count();
     sched::init(num_cpus);
 
+    // NOTE: Don't clear TTBR0 during boot — Limine's boot stack is
+    // identity-mapped via TTBR0. TLB flush happens in the trampoline after
+    // switch_to_new moves us to the user thread's HHDM kernel stack.
+
+    // Secondary CPUs disabled — GICv2 driver needs work for AP init
+    // #[cfg(target_arch = "aarch64")]
+    // arch::aarch64::start_secondary_cpus();
+
+    drivers::uart::early_print("A1\n");
+    // Create the console PTY (pty 0) — UART RX bytes flow into this PTY
+    let console_pty_id = drivers::pty::create_console_pty();
+    drivers::uart::early_print("A2\n");
+    log::info!("Console PTY: /dev/pts/{console_pty_id}");
+
+    // Enable UART RX interrupt so typed characters reach the PTY
     #[cfg(target_arch = "aarch64")]
-    arch::aarch64::start_secondary_cpus();
+    arch::aarch64::gic::enable_irq(arch::aarch64::gic::UART0_IRQ);
+    drivers::uart::enable_rx_interrupt();
 
     // Probe VirtIO devices
     let hhdm = arch::aarch64::hhdm_offset();
@@ -78,7 +94,7 @@ unsafe extern "C" fn _start() -> ! {
     }
 
     // Spawn init process
-    let init_paths = ["/bin/bash", "/bin/hello_raw"];
+    let init_paths = ["/bin/bash", "/bin/hello_raw", "/bin/hello"];
     for path in &init_paths {
         match sched::spawn_user_process(path, &[path.as_bytes()], &[
             b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -102,220 +118,30 @@ unsafe extern "C" fn _start() -> ! {
 }
 
 fn run_first_user_process() {
-    // Get user process info
-    let (entry, user_sp, our_root_phys) = {
+    // All user mappings (ELF, interpreter, stack) are already in aspace.root_phys.
+    // No TTBR0 merge with Limine is needed — user code only accesses user VA space,
+    // and kernel syscalls use TTBR1 for kernel VA.
+
+    let has_user = {
         let sched = sched::SCHEDULER.lock();
-        let thread = match sched.run_queues[0].front() {
-            Some(t) if t.is_user => t,
-            _ => { log::warn!("No user process"); return; }
-        };
-        (thread.context.elr, thread.context.sp_el0, thread.context.ttbr0)
+        sched.run_queues[0].front().map_or(false, |t| t.is_user)
     };
 
-    let hhdm = arch::aarch64::hhdm_offset();
-
-    // Get Limine's current TTBR0 (which has HHDM mappings)
-    let limine_ttbr0: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) limine_ttbr0) };
-    let limine_l0_phys = limine_ttbr0 & 0x0000_FFFF_FFFF_F000;
-
-    // Create a NEW L0 table: copy Limine's entries, then overlay ours
-    let new_l0_phys = mm::pmm::alloc_page().expect("Failed to alloc page") as u64;
-    let new_l0 = (new_l0_phys + hhdm) as *mut u64;
-
-    // Zero it
-    unsafe { core::ptr::write_bytes(new_l0, 0, 4096) };
-
-    let limine_l0 = (limine_l0_phys + hhdm) as *const u64;
-    let our_l0 = (our_root_phys + hhdm) as *const u64;
-
-    // Copy Limine's entries first
-    for i in 0..512 {
-        let limine_entry = unsafe { core::ptr::read_volatile(limine_l0.add(i)) };
-        if limine_entry != 0 {
-            unsafe { core::ptr::write_volatile(new_l0.add(i), limine_entry) };
-        }
+    if !has_user {
+        log::warn!("No user process in run queue");
+        return;
     }
 
-    drivers::uart::early_print("Limine L0 copied.\n");
+    log::info!("Starting first user process via scheduler");
 
-    // Map interpreter directly into merged table (after Limine L0 copy, before L1 merge)
-    {
-        let interp_path = "/lib/ld-linux-aarch64.so.1";
-        let interp_base: u64 = 0x0000_0050_0000_0000;
-        if let Ok(node) = fs::vfs::resolve_path(interp_path) {
-            let data = node.lock().data.clone();
-            if !data.is_empty() {
-                map_interp_to_table(new_l0_phys, &data, interp_base, hhdm);
-                let check = (new_l0_phys + hhdm) as *const u64;
-                let l0a = unsafe { core::ptr::read_volatile(check.add(0xA)) };
-                log::info!("Interp mapped: L0[0xA]=0x{:x}", l0a);
-            }
-        }
-    }
+    // Mask IRQs to prevent re-entrant SCHEDULER lock deadlock.
+    // After ERET to EL0, SPSR_EL1=0 restores PSTATE with IRQs enabled.
+    unsafe { core::arch::asm!("msr DAIFSet, #2"); }
 
-    // Merge user page table entries, preserving HHDM mappings
-    for i in 0..512 {
-        let our_entry = unsafe { core::ptr::read_volatile(our_l0.add(i)) };
-        if our_entry == 0 { continue; }
+    crate::sched::scheduler::schedule();
 
-        let limine_entry = unsafe { core::ptr::read_volatile(new_l0.add(i) as *const u64) };
-        if limine_entry == 0 {
-            // No conflict — just use our entry
-            unsafe { core::ptr::write_volatile(new_l0.add(i), our_entry) };
-        } else {
-            // CONFLICT: both Limine (HHDM) and user have entries at this L0 index
-            // Must merge at L1 level
-            let limine_l1_phys = limine_entry & 0x0000_FFFF_FFFF_F000;
-            let our_l1_phys = our_entry & 0x0000_FFFF_FFFF_F000;
-
-            let new_l1_phys = mm::pmm::alloc_page().unwrap() as u64;
-            let new_l1 = (new_l1_phys + hhdm) as *mut u64;
-            unsafe { core::ptr::write_bytes(new_l1, 0, 4096); }
-
-            // Copy Limine's L1 entries first (HHDM)
-            let limine_l1 = (limine_l1_phys + hhdm) as *const u64;
-            for j in 0..512 {
-                let le = unsafe { core::ptr::read_volatile(limine_l1.add(j)) };
-                if le != 0 {
-                    unsafe { core::ptr::write_volatile(new_l1.add(j), le); }
-                }
-            }
-            // Overlay our user L1 entries — user entries WIN over Limine's
-            // because user code needs to be at these addresses
-            let our_l1 = (our_l1_phys + hhdm) as *const u64;
-            for j in 0..512 {
-                let oe = unsafe { core::ptr::read_volatile(our_l1.add(j)) };
-                if oe != 0 {
-                    // User entry overrides Limine's identity map
-                    unsafe { core::ptr::write_volatile(new_l1.add(j), oe); }
-                }
-            }
-
-            let new_l0_entry = new_l1_phys | 0x3; // valid + table
-            unsafe { core::ptr::write_volatile(new_l0.add(i), new_l0_entry); }
-        }
-    }
-
-    // Verify critical L0 entries after merge
-    let v_l0 = (new_l0_phys + hhdm) as *const u64;
-    drivers::uart::early_print("PostMerge L0[0]=");
-    print_hex_early(unsafe { *v_l0 });
-    drivers::uart::early_print(" L0[0xA]=");
-    print_hex_early(unsafe { *v_l0.add(0xA) });
-    drivers::uart::early_print(" L0[0xFF]=");
-    print_hex_early(unsafe { *v_l0.add(0xFF) });
-    drivers::uart::early_print("\n");
-
-    // Verify the merged mapping
-    let verify_l0 = (new_l0_phys + hhdm) as *const u64;
-    let l0_entry = unsafe { core::ptr::read_volatile(verify_l0) }; // L0[0]
-    drivers::uart::early_print("Merged L0[0]=");
-    print_hex_early(l0_entry);
-    drivers::uart::early_print("\n");
-
-    // Walk to find what's at 0x400080 via new table
-    if l0_entry & 1 != 0 {
-        let l1_phys = l0_entry & 0x0000_FFFF_FFFF_F000;
-        let l1 = (l1_phys + hhdm) as *const u64;
-        let l1_entry = unsafe { core::ptr::read_volatile(l1) }; // L1[0] for VA < 1GB
-        drivers::uart::early_print("L1[0]=");
-        print_hex_early(l1_entry);
-        drivers::uart::early_print("\n");
-
-        if l1_entry & 1 != 0 {
-            let l2_phys = l1_entry & 0x0000_FFFF_FFFF_F000;
-            let l2 = (l2_phys + hhdm) as *const u64;
-            let l2_idx = (0x400080 >> 21) & 0x1FF; // = 2
-            let l2_entry = unsafe { core::ptr::read_volatile(l2.add(l2_idx as usize)) };
-            drivers::uart::early_print("L2[2]=");
-            print_hex_early(l2_entry);
-            drivers::uart::early_print("\n");
-
-            if l2_entry & 1 != 0 {
-                let l3_phys = l2_entry & 0x0000_FFFF_FFFF_F000;
-                let l3 = (l3_phys + hhdm) as *const u64;
-                let l3_idx = (0x400080 >> 12) & 0x1FF; // = 0
-                let l3_entry = unsafe { core::ptr::read_volatile(l3.add(l3_idx as usize)) };
-                drivers::uart::early_print("L3[0]=");
-                print_hex_early(l3_entry);
-                drivers::uart::early_print("\n");
-
-                if l3_entry & 1 != 0 {
-                    let page_phys = l3_entry & 0x0000_FFFF_FFFF_F000;
-                    let page_kva = (page_phys + hhdm + 0x80) as *const u32;
-                    let inst = unsafe { core::ptr::read_volatile(page_kva) };
-                    drivers::uart::early_print("Inst@400080=");
-                    print_hex_early(inst as u64);
-                    drivers::uart::early_print("\n");
-                }
-            }
-        }
-    }
-
-    // Check our original page table L0 entries
-    {
-        let sg = sched::SCHEDULER.lock();
-        let t = sg.run_queues[0].front().unwrap();
-        if let Some(ref aspace) = t.address_space {
-            log::debug!("Thread root_phys = 0x{:x}", aspace.root_phys);
-            let our = (aspace.root_phys + hhdm) as *const u64;
-            log::debug!("Our L0[0] = 0x{:x}", unsafe { *our.add(0) });
-            log::debug!("Our L0[0xA] = 0x{:x}", unsafe { *our.add(0xA) });
-            log::debug!("Our L0[0xFF] = 0x{:x}", unsafe { *our.add(0xFF) });
-        }
-        drop(sg);
-    }
-
-    // Verify key L0 entries in merged table
-    let verify_l0 = (new_l0_phys + hhdm) as *const u64;
-    log::debug!("Merged L0[0] = 0x{:x}", unsafe { *verify_l0.add(0) });   // code (0x400000)
-    log::debug!("Merged L0[0xA] = 0x{:x}", unsafe { *verify_l0.add(0xA) }); // interp (0x5000000000)
-    log::debug!("Merged L0[0xFF] = 0x{:x}", unsafe { *verify_l0.add(0xFF) }); // stack
-
-    // Verify stack page is mapped
-    let hhdm2 = arch::aarch64::hhdm_offset();
-    let merged_l0 = (new_l0_phys + hhdm2) as *const u64;
-    let stack_l0_idx = (0x7FFFFFFFEu64 >> 27) & 0x1FF;  // L0 index for stack
-    let stack_l0_entry = unsafe { core::ptr::read_volatile(merged_l0.add(0xFF)) };
-    log::debug!("Merged L0[0xFF] (stack) = 0x{:x}", stack_l0_entry);
-
-    // Try to read from the stack address via HHDM to verify data
-    let sched_guard = sched::SCHEDULER.lock();
-    let thread = sched_guard.run_queues[0].front().unwrap();
-    if let Some(ref aspace) = thread.address_space {
-        if let Some(sp_phys) = aspace.translate(user_sp) {
-            let sp_kva = sp_phys + hhdm2;
-            let argc = unsafe { *(sp_kva as *const u64) };
-            log::debug!("Stack verify: sp=0x{:x} phys=0x{:x} argc={}", user_sp, sp_phys, argc);
-            // Read first 24 u64s from sp to see argc+argv+envp+auxv
-            for i in 0..24 {
-                let val = unsafe { *((sp_kva + i * 8) as *const u64) };
-                log::debug!("  sp[{}] = 0x{:x}", i, val);
-            }
-        } else {
-            log::error!("Stack VA 0x{:x} not mapped!", user_sp);
-        }
-    }
-    drop(sched_guard);
-
-    // Verify interpreter entry point code
-    let ttbr0_check: u64;
-    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0_check) };
-    let hhdm2 = arch::aarch64::hhdm_offset();
-    if let Some(pa) = crate::syscall::fs::walk_user_page_table(ttbr0_check, entry as u64, hhdm2) {
-        let kva = pa + hhdm2;
-        let inst0 = unsafe { *(kva as *const u32) };
-        let inst1 = unsafe { *((kva + 4) as *const u32) };
-        log::info!("Entry code: [{:08x}] [{:08x}]", inst0, inst1);
-    } else {
-        log::error!("Entry point 0x{:x} NOT MAPPED!", entry);
-    }
-
-    log::info!("ERET to EL0: entry=0x{entry:x} sp=0x{user_sp:x}");
-
-    let spsr: u64 = 0; // EL0t
-    unsafe { jump_to_el0(entry, spsr, user_sp, new_l0_phys) };
+    // Never reached — schedule() → switch_to_new → trampoline → eret to EL0
+    loop { arch::PlatformArch::halt(); }
 }
 
 /// Minimal static AArch64 ELF that does write(1, "Hello from userspace!\n", 22) then exit(0)
@@ -461,7 +287,8 @@ fn ensure_vfs_dir(path: &str) {
     }
 }
 
-/// Map interpreter ELF segments directly into a page table
+/// Map interpreter ELF segments directly into a page table (unused, kept for reference)
+#[allow(dead_code)]
 fn map_interp_to_table(l0_phys: u64, data: &[u8], base: u64, hhdm: u64) {
     use crate::arch::aarch64::paging::PageFlags;
     use crate::mm::mmap::map_page_in_ttbr0;

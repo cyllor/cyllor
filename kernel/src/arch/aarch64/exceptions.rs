@@ -99,7 +99,7 @@ global_asm!(
     "lower_irq_handler:",
     "SAVE_REGS",
     "mov x0, sp",
-    "bl irq_handler_rust",
+    "bl lower_irq_handler_rust",
     "RESTORE_REGS",
     "eret",
 
@@ -117,13 +117,17 @@ global_asm!(
     "b .",
 );
 
+unsafe extern "C" {
+    fn exception_vector_table();
+}
+
 pub fn init() {
     unsafe {
+        let tbl = exception_vector_table as usize as u64;
         core::arch::asm!(
-            "adr x0, exception_vector_table",
-            "msr VBAR_EL1, x0",
+            "msr VBAR_EL1, {0}",
             "isb",
-            out("x0") _,
+            in(reg) tbl,
         );
     }
     log::debug!("Exception vector table installed");
@@ -141,11 +145,34 @@ extern "C" fn irq_handler_rust(_frame: *mut TrapFrame) {
     match intid {
         gic::TIMER_IRQ => {
             timer::reset();
-            TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let tick = TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // (timer tick trace removed for cleanliness)
             crate::sched::timer_tick();
         }
         gic::SGI_RESCHEDULE => {
             crate::sched::timer_tick();
+        }
+        gic::UART0_IRQ => {
+            crate::drivers::uart::handle_rx_interrupt();
+        }
+        1020..=1023 => return,
+        _ => {}
+    }
+    gic::end_interrupt(intid);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn lower_irq_handler_rust(_frame: *mut TrapFrame) {
+    let intid = gic::ack_interrupt();
+    match intid {
+        gic::TIMER_IRQ => {
+            timer::reset();
+            let tick = TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // User-mode timer tick
+            crate::sched::timer_tick();
+        }
+        gic::UART0_IRQ => {
+            crate::drivers::uart::handle_rx_interrupt();
         }
         1020..=1023 => return,
         _ => {}
@@ -182,9 +209,24 @@ extern "C" fn sync_handler_rust(frame: *mut TrapFrame) {
 
 #[unsafe(no_mangle)]
 extern "C" fn lower_sync_handler_rust(frame: *mut TrapFrame) {
+    static LSC: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let _n = LSC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let esr: u64;
     unsafe { core::arch::asm!("mrs {}, ESR_EL1", out(reg) esr) };
     let ec = (esr >> 26) & 0x3F;
+
+    if ec != 0x15 {
+        let far: u64;
+        unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
+        let elr = unsafe { (*frame).elr };
+        crate::drivers::uart::early_print("LE:");
+        print_dec(ec);
+        crate::drivers::uart::early_print(" elr=");
+        print_dec(elr);
+        crate::drivers::uart::early_print(" far=");
+        print_dec(far);
+        crate::drivers::uart::early_print("\n");
+    }
 
     match ec {
         0x15 => {
@@ -197,8 +239,7 @@ extern "C" fn lower_sync_handler_rust(frame: *mut TrapFrame) {
             unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
             if !handle_page_fault(far, false) {
                 let elr = unsafe { (*frame).elr };
-                log::error!("User instruction abort: ELR=0x{elr:016x} FAR=0x{far:016x}");
-                // Kill process
+                log::error!("FATAL: User iabort: ELR=0x{elr:016x} FAR=0x{far:016x}");
                 loop { core::hint::spin_loop(); }
             }
         }
@@ -209,16 +250,15 @@ extern "C" fn lower_sync_handler_rust(frame: *mut TrapFrame) {
             let is_write = (esr >> 6) & 1 != 0;
             if !handle_page_fault(far, is_write) {
                 let elr = unsafe { (*frame).elr };
-                log::error!("User data abort: ELR=0x{elr:016x} FAR=0x{far:016x} write={is_write}");
+                log::error!("FATAL: User dabort: ELR=0x{elr:016x} FAR=0x{far:016x} w={is_write}");
                 loop { core::hint::spin_loop(); }
             }
-            // Successfully handled — return to user and retry the instruction
         }
         _ => {
             let far: u64;
             unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
             let elr = unsafe { (*frame).elr };
-            log::error!("User exception: EC=0x{ec:02x} ELR=0x{elr:016x} FAR=0x{far:016x}");
+            log::error!("FATAL: User exc: EC=0x{ec:02x} ELR=0x{elr:016x} FAR=0x{far:016x}");
             loop { core::hint::spin_loop(); }
         }
     }

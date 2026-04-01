@@ -88,12 +88,16 @@ pub enum FileType {
     EventFd,
     MemFd,
     Socket,
+    PtyMaster,
+    PtySlave,
 }
 
 pub enum SpecialData {
     EventFdVal(u64),
     PipeBuffer(Arc<Mutex<Vec<u8>>>),
     MemFdData(Vec<u8>),
+    PtyMaster(u32),
+    PtySlave(u32),
 }
 
 impl FileObject {
@@ -166,8 +170,41 @@ impl FileObject {
                 Ok(data)
             }
             FileType::CharDevice => {
-                // Character device read - stub
-                Ok(0)
+                if let Some(ref inode) = self.inode {
+                    let node = inode.lock();
+                    match (node.dev_major, node.dev_minor) {
+                        (1, 3) => Ok(0), // /dev/null
+                        (1, 5) => { // /dev/zero
+                            if count > 0 {
+                                unsafe { core::ptr::write_bytes(buf as *mut u8, 0, count); }
+                            }
+                            Ok(count)
+                        }
+                        (1, 9) => { // /dev/urandom
+                            let mut seed = crate::arch::ticks();
+                            let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count) };
+                            for b in out.iter_mut() {
+                                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                                *b = (seed >> 33) as u8;
+                            }
+                            Ok(count)
+                        }
+                        (13, minor @ 64..=127) => {
+                            // /dev/input/event* — read from per-device queue
+                            let n = crate::drivers::input::read_events_for_minor(minor, buf, count);
+                            Ok(n)
+                        }
+                        (226, _) => {
+                            // DRM device: read pending events
+                            let n = crate::drivers::drm::read_events(buf, count);
+                            Ok(n)
+                        }
+                        (5, _) => Err(crate::syscall::EAGAIN), // /dev/tty
+                        _ => Ok(0),
+                    }
+                } else {
+                    Ok(0)
+                }
             }
             FileType::Pipe => {
                 if let Some(SpecialData::PipeBuffer(ref pipe_buf)) = self.special_data {
@@ -192,6 +229,47 @@ impl FileObject {
                     Ok(8)
                 } else {
                     Ok(0)
+                }
+            }
+            FileType::PtyMaster => {
+                let pty_id = match &self.special_data {
+                    Some(SpecialData::PtyMaster(id)) => *id,
+                    _ => return Ok(0),
+                };
+                loop {
+                    if let Some(pty_arc) = crate::drivers::pty::get_pty(pty_id) {
+                        let pty = pty_arc.lock();
+                        let mut rb = pty.master_rx.lock();
+                        if !rb.is_empty() {
+                            let to_read = count.min(rb.len());
+                            let _ = crate::syscall::fs::copy_to_user(buf, &rb[..to_read]);
+                            rb.drain(..to_read);
+                            return Ok(to_read);
+                        }
+                    }
+                    // Non-blocking check
+                    if self.flags & 0o4000 != 0 { return Err(crate::syscall::EAGAIN); }
+                    crate::sched::timer_tick();
+                }
+            }
+            FileType::PtySlave => {
+                let pty_id = match &self.special_data {
+                    Some(SpecialData::PtySlave(id)) => *id,
+                    _ => return Ok(0),
+                };
+                loop {
+                    if let Some(pty_arc) = crate::drivers::pty::get_pty(pty_id) {
+                        let pty = pty_arc.lock();
+                        let mut rb = pty.slave_rx.lock();
+                        if !rb.is_empty() {
+                            let to_read = count.min(rb.len());
+                            let _ = crate::syscall::fs::copy_to_user(buf, &rb[..to_read]);
+                            rb.drain(..to_read);
+                            return Ok(to_read);
+                        }
+                    }
+                    if self.flags & 0o4000 != 0 { return Err(crate::syscall::EAGAIN); }
+                    crate::sched::timer_tick();
                 }
             }
             _ => Ok(0),
@@ -250,6 +328,32 @@ impl FileObject {
                 }
                 Ok(8)
             }
+            FileType::PtyMaster => {
+                // Master write → line discipline → slave_rx
+                if let Some(SpecialData::PtyMaster(id)) = &self.special_data {
+                    let data = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+                    crate::drivers::pty::master_write(*id, data);
+                }
+                Ok(count)
+            }
+            FileType::PtySlave => {
+                // Slave write → output processing (c_oflag) → master_rx
+                if let Some(SpecialData::PtySlave(id)) = &self.special_data {
+                    let data = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+                    crate::drivers::pty::slave_write(*id, data);
+                    // For the console PTY, also echo to UART so output is visible
+                    if *id == crate::drivers::pty::console_pty_id() {
+                        if let Some(pty_arc) = crate::drivers::pty::get_pty(*id) {
+                            let pty = pty_arc.lock();
+                            let processed = crate::drivers::pty::process_output(&pty, data);
+                            for &b in &processed {
+                                crate::drivers::uart::write_byte(b);
+                            }
+                        }
+                    }
+                }
+                Ok(count)
+            }
             _ => Ok(count),
         }
     }
@@ -306,32 +410,255 @@ impl FileObject {
     }
 
     pub fn ioctl(&mut self, request: u64, arg: u64) -> SyscallResult {
-        // Check if this is a DRM device
-        if let Some(ref inode) = self.inode {
-            let node = inode.lock();
-            if node.dev_major == 226 {
-                // DRM device
-                return crate::drivers::drm::handle_ioctl(request, arg);
+        // ---- PTY-specific ioctls (master or slave) ----
+        if self.ftype == FileType::PtyMaster || self.ftype == FileType::PtySlave {
+            let id = match &self.special_data {
+                Some(SpecialData::PtyMaster(id)) | Some(SpecialData::PtySlave(id)) => *id,
+                _ => return Ok(0),
+            };
+
+            match request {
+                // --- termios ---
+                0x5401 => { // TCGETS
+                    if arg != 0 {
+                        if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
+                            let pty = pty_arc.lock();
+                            let buf = pty.termios.to_bytes();
+                            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), arg as *mut u8, 60); }
+                        }
+                    }
+                    return Ok(0);
+                }
+                0x5402 | 0x5403 | 0x5404 => { // TCSETS / TCSETSW / TCSETSF
+                    if arg != 0 {
+                        if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
+                            let mut buf = [0u8; 60];
+                            unsafe { core::ptr::copy_nonoverlapping(arg as *const u8, buf.as_mut_ptr(), 60); }
+                            let mut pty = pty_arc.lock();
+                            pty.termios = crate::drivers::pty::Termios::from_bytes(&buf);
+                        }
+                    }
+                    return Ok(0);
+                }
+                0x5407 | 0x540B => return Ok(0), // TCSETAF, TCFLSH
+
+                // --- window size ---
+                0x5413 => { // TIOCGWINSZ
+                    if arg != 0 {
+                        if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
+                            let pty = pty_arc.lock();
+                            unsafe {
+                                *((arg + 0) as *mut u16) = pty.winsize.ws_row;
+                                *((arg + 2) as *mut u16) = pty.winsize.ws_col;
+                                *((arg + 4) as *mut u16) = pty.winsize.ws_xpixel;
+                                *((arg + 6) as *mut u16) = pty.winsize.ws_ypixel;
+                            }
+                        }
+                    }
+                    return Ok(0);
+                }
+                0x5414 => { // TIOCSWINSZ
+                    if arg != 0 {
+                        if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
+                            let mut pty = pty_arc.lock();
+                            unsafe {
+                                pty.winsize.ws_row = *((arg + 0) as *const u16);
+                                pty.winsize.ws_col = *((arg + 2) as *const u16);
+                                pty.winsize.ws_xpixel = *((arg + 4) as *const u16);
+                                pty.winsize.ws_ypixel = *((arg + 6) as *const u16);
+                            }
+                        }
+                    }
+                    return Ok(0);
+                }
+
+                // --- controlling terminal ---
+                0x540E => { // TIOCSCTTY
+                    if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
+                        let mut pty = pty_arc.lock();
+                        pty.session = 1; // simplified: use pid 1
+                    }
+                    return Ok(0);
+                }
+
+                // --- foreground process group ---
+                0x540F => { // TIOCGPGRP
+                    if arg != 0 {
+                        if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
+                            let pty = pty_arc.lock();
+                            unsafe { *(arg as *mut i32) = pty.fg_pgrp; }
+                        }
+                    }
+                    return Ok(0);
+                }
+                0x5410 => { // TIOCSPGRP
+                    if arg != 0 {
+                        if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
+                            let mut pty = pty_arc.lock();
+                            unsafe { pty.fg_pgrp = *(arg as *const i32); }
+                        }
+                    }
+                    return Ok(0);
+                }
+
+                // --- PTY number / lock ---
+                0x80045430 => { // TIOCGPTN - get PTY number
+                    if arg != 0 { unsafe { *(arg as *mut u32) = id; } }
+                    return Ok(0);
+                }
+                0x40045431 => { // TIOCSPTLCK - lock/unlock PTY
+                    if arg != 0 {
+                        if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
+                            let mut pty = pty_arc.lock();
+                            let val = unsafe { *(arg as *const i32) };
+                            pty.locked = val != 0;
+                        }
+                    }
+                    return Ok(0);
+                }
+
+                0x5441 => { // TIOCGPTPEER - return a slave fd
+                    let file = Arc::new(Mutex::new(FileObject {
+                        inode: None, offset: 0, flags: 0,
+                        ftype: FileType::PtySlave,
+                        special_data: Some(SpecialData::PtySlave(id)),
+                    }));
+                    return crate::fs::fdtable::alloc_fd(file);
+                }
+
+                // --- FIONREAD ---
+                0x541B => {
+                    if arg != 0 {
+                        if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
+                            let pty = pty_arc.lock();
+                            let count = if self.ftype == FileType::PtyMaster {
+                                pty.master_rx.lock().len()
+                            } else {
+                                pty.slave_rx.lock().len()
+                            };
+                            unsafe { *(arg as *mut i32) = count as i32; }
+                        }
+                    }
+                    return Ok(0);
+                }
+
+                // TIOCGSID — get session ID
+                0x5429 => {
+                    if arg != 0 {
+                        if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
+                            let pty = pty_arc.lock();
+                            unsafe { *(arg as *mut i32) = pty.session; }
+                        }
+                    }
+                    return Ok(0);
+                }
+
+                _ => {
+                    // Fall through to common ioctls below
+                }
             }
         }
 
-        // Common ioctls
+        // ---- DRM device ioctls ----
+        if let Some(ref inode) = self.inode {
+            let node = inode.lock();
+            if node.dev_major == 226 {
+                return crate::drivers::drm::handle_ioctl(request, arg);
+            }
+            // ---- Input device ioctls ----
+            if node.dev_major == 13 && node.dev_minor >= 64 {
+                return crate::drivers::input::handle_ioctl_with_minor(node.dev_minor, request, arg);
+            }
+        }
+
+        // ---- Common terminal ioctls (for non-PTY ttys, e.g. /dev/tty) ----
+        let console_id = crate::drivers::pty::console_pty_id();
         match request {
-            0x5401 => { // TCGETS - terminal attrs
+            0x5401 => { // TCGETS
                 if arg != 0 {
-                    unsafe { core::ptr::write_bytes(arg as *mut u8, 0, 60); }
+                    if let Some(pty_arc) = crate::drivers::pty::get_pty(console_id) {
+                        let pty = pty_arc.lock();
+                        let buf = pty.termios.to_bytes();
+                        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), arg as *mut u8, 60); }
+                    } else {
+                        let buf = crate::drivers::pty::Termios::default_cooked().to_bytes();
+                        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), arg as *mut u8, 60); }
+                    }
+                }
+                Ok(0)
+            }
+            0x5402 | 0x5403 | 0x5404 => { // TCSETS / TCSETSW / TCSETSF
+                if arg != 0 {
+                    if let Some(pty_arc) = crate::drivers::pty::get_pty(console_id) {
+                        let mut buf = [0u8; 60];
+                        unsafe { core::ptr::copy_nonoverlapping(arg as *const u8, buf.as_mut_ptr(), 60); }
+                        let mut pty = pty_arc.lock();
+                        pty.termios = crate::drivers::pty::Termios::from_bytes(&buf);
+                    }
+                }
+                Ok(0)
+            }
+            0x5407 | 0x540B => Ok(0), // TCSETAF, TCFLSH
+            0x540E => Ok(0), // TIOCSCTTY
+            0x540F => { // TIOCGPGRP
+                if arg != 0 {
+                    if let Some(pty_arc) = crate::drivers::pty::get_pty(console_id) {
+                        let pty = pty_arc.lock();
+                        unsafe { *(arg as *mut i32) = pty.fg_pgrp; }
+                    } else {
+                        unsafe { *(arg as *mut i32) = 1; }
+                    }
+                }
+                Ok(0)
+            }
+            0x5410 => { // TIOCSPGRP
+                if arg != 0 {
+                    if let Some(pty_arc) = crate::drivers::pty::get_pty(console_id) {
+                        let mut pty = pty_arc.lock();
+                        unsafe { pty.fg_pgrp = *(arg as *const i32); }
+                    }
                 }
                 Ok(0)
             }
             0x5413 => { // TIOCGWINSZ
                 if arg != 0 {
-                    unsafe {
-                        *((arg) as *mut u16) = 25;   // rows
-                        *((arg + 2) as *mut u16) = 80; // cols
-                        *((arg + 4) as *mut u16) = 0;
-                        *((arg + 6) as *mut u16) = 0;
+                    if let Some(pty_arc) = crate::drivers::pty::get_pty(console_id) {
+                        let pty = pty_arc.lock();
+                        unsafe {
+                            *((arg + 0) as *mut u16) = pty.winsize.ws_row;
+                            *((arg + 2) as *mut u16) = pty.winsize.ws_col;
+                            *((arg + 4) as *mut u16) = pty.winsize.ws_xpixel;
+                            *((arg + 6) as *mut u16) = pty.winsize.ws_ypixel;
+                        }
+                    } else {
+                        unsafe {
+                            *((arg + 0) as *mut u16) = 24;
+                            *((arg + 2) as *mut u16) = 80;
+                            *((arg + 4) as *mut u16) = 640;
+                            *((arg + 6) as *mut u16) = 384;
+                        }
                     }
                 }
+                Ok(0)
+            }
+            0x5414 => { // TIOCSWINSZ
+                if arg != 0 {
+                    if let Some(pty_arc) = crate::drivers::pty::get_pty(console_id) {
+                        let mut pty = pty_arc.lock();
+                        unsafe {
+                            pty.winsize.ws_row = *((arg + 0) as *const u16);
+                            pty.winsize.ws_col = *((arg + 2) as *const u16);
+                        }
+                    }
+                }
+                Ok(0)
+            }
+            0x5405 | 0x5406 => { // legacy TIOCSPGRP / TIOCGPGRP
+                if arg != 0 { unsafe { *(arg as *mut i32) = 1; } }
+                Ok(0)
+            }
+            0x541B => { // FIONREAD
+                if arg != 0 { unsafe { *(arg as *mut i32) = 0; } }
                 Ok(0)
             }
             _ => Ok(0), // Accept unknown ioctls silently
@@ -363,18 +690,7 @@ pub fn init() {
 }
 
 pub fn root() -> Arc<Mutex<Inode>> {
-    crate::drivers::uart::early_print("R+");
-    let guard = ROOT.lock();
-    crate::drivers::uart::early_print("a");
-    let opt = guard.as_ref();
-    crate::drivers::uart::early_print("b");
-    let arc = opt.unwrap();
-    crate::drivers::uart::early_print("c");
-    let cloned = arc.clone();
-    crate::drivers::uart::early_print("d");
-    drop(guard);
-    crate::drivers::uart::early_print("-\n");
-    cloned
+    ROOT.lock().as_ref().unwrap().clone()
 }
 
 pub fn current_dir() -> String {
@@ -408,7 +724,6 @@ pub fn resolve_path(path: &str) -> Result<Arc<Mutex<Inode>>, i32> {
             continue;
         }
         if component == ".." {
-            // For simplicity, stay at root
             continue;
         }
 
@@ -421,12 +736,53 @@ pub fn resolve_path(path: &str) -> Result<Arc<Mutex<Inode>>, i32> {
         };
 
         match next {
-            Some(child) => current = child,
+            Some(child) => {
+                // Follow symlinks
+                let is_symlink = child.lock().itype == InodeType::Symlink;
+                if is_symlink {
+                    let target = {
+                        let n = child.lock();
+                        alloc::string::String::from_utf8_lossy(&n.data).into_owned()
+                    };
+                    current = resolve_path(&target)?;
+                } else {
+                    current = child;
+                }
+            }
             None => return Err(ENOENT),
         }
     }
 
     Ok(current)
+}
+
+/// Resolve a path but do NOT follow the final component if it is a symlink.
+/// Used by readlinkat to read the symlink target.
+pub fn resolve_path_lstat(path: &str) -> Result<Arc<Mutex<Inode>>, i32> {
+    if path == "/" || path.is_empty() {
+        return Ok(root());
+    }
+
+    let trimmed = path.trim_start_matches('/');
+    if let Some(pos) = trimmed.rfind('/') {
+        let parent_path = &trimmed[..pos];
+        let last = &trimmed[pos + 1..];
+        // Resolve the parent (follows symlinks)
+        let parent_node = resolve_path(&alloc::format!("/{}", parent_path))?;
+        let pn = parent_node.lock();
+        match pn.children.get(last) {
+            Some(child) => Ok(child.clone()),
+            None => Err(ENOENT),
+        }
+    } else {
+        // Single component, parent is root
+        let r = root();
+        let rn = r.lock();
+        match rn.children.get(trimmed) {
+            Some(child) => Ok(child.clone()),
+            None => Err(ENOENT),
+        }
+    }
 }
 
 pub fn open_node(inode: Arc<Mutex<Inode>>, flags: u32) -> Result<Arc<Mutex<FileObject>>, i32> {

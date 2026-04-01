@@ -27,3 +27,7 @@ pub use self::aarch64::{early_init, memory_map};
 pub const ARCH_NAME: &str = "aarch64";
 #[cfg(target_arch = "aarch64")]
 pub use self::aarch64::cpu_count;
+#[cfg(target_arch = "aarch64")]
+pub fn ticks() -> u64 { aarch64::exceptions::ticks() }
+#[cfg(target_arch = "aarch64")]
+pub fn hhdm_offset() -> u64 { aarch64::hhdm_offset() }

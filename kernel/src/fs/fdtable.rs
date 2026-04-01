@@ -20,15 +20,29 @@ impl FdTable {
     fn ensure_init(&mut self) {
         if self.files.is_empty() {
             self.files.resize_with(MAX_FDS, || None);
-            // FDs 0, 1, 2 are stdin, stdout, stderr - create char device files
-            for fd in 0..3 {
-                self.files[fd] = Some(Arc::new(Mutex::new(FileObject {
-                    inode: None,
-                    offset: 0,
-                    flags: 0,
-                    ftype: super::vfs::FileType::CharDevice,
-                    special_data: None,
-                })));
+            // FDs 0, 1, 2 are stdin, stdout, stderr — connect to console PTY slave
+            let pty_id = crate::drivers::pty::console_pty_id();
+            if pty_id != u32::MAX {
+                for fd in 0..3 {
+                    self.files[fd] = Some(Arc::new(Mutex::new(FileObject {
+                        inode: None,
+                        offset: 0,
+                        flags: 0,
+                        ftype: super::vfs::FileType::PtySlave,
+                        special_data: Some(super::vfs::SpecialData::PtySlave(pty_id)),
+                    })));
+                }
+            } else {
+                // Fallback: bare char devices (before PTY init)
+                for fd in 0..3 {
+                    self.files[fd] = Some(Arc::new(Mutex::new(FileObject {
+                        inode: None,
+                        offset: 0,
+                        flags: 0,
+                        ftype: super::vfs::FileType::CharDevice,
+                        special_data: None,
+                    })));
+                }
             }
         }
     }

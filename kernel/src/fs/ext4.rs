@@ -217,7 +217,6 @@ impl Ext4Fs {
         }
 
         // Depth > 0: traverse index nodes
-        // For simplicity, only support depth 1
         let indices = unsafe {
             core::slice::from_raw_parts(
                 (i_block.as_ptr() as *const ExtentHeader).add(1) as *const ExtentIdx,
@@ -225,7 +224,8 @@ impl Ext4Fs {
             )
         };
 
-        let target_block = offset / self.block_size;
+        // Collect all leaf extents from all index nodes
+        let mut all_extents: Vec<Extent> = Vec::new();
         for idx in indices {
             let leaf_block = (idx.ei_leaf_lo as u64) | ((idx.ei_leaf_hi as u64) << 32);
             let mut leaf_buf = alloc::vec![0u8; self.block_size];
@@ -242,14 +242,10 @@ impl Ext4Fs {
                     leaf_header.eh_entries as usize,
                 )
             };
-
-            let read = self.read_from_extents(extents, offset, buf)?;
-            if read > 0 {
-                return Ok(read);
-            }
+            all_extents.extend_from_slice(extents);
         }
 
-        Ok(0)
+        self.read_from_extents(&all_extents, offset, buf)
     }
 
     fn read_from_extents(&self, extents: &[Extent], offset: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
@@ -336,16 +332,26 @@ impl Ext4Fs {
         let inode = self.read_inode(ino)?;
         let size = self.inode_size(&inode) as usize;
         let mut data = alloc::vec![0u8; size];
-        self.read_extents(&inode, 0, &mut data)?;
+        let read = self.read_extents(&inode, 0, &mut data)?;
+        if ino != EXT4_ROOT_INO {
+            log::debug!("ext4 read_dir ino={}: size={} read={}", ino, size, read);
+        }
 
         let mut entries = Vec::new();
         let mut pos = 0;
         while pos + 8 <= data.len() {
             let de = unsafe { &*(data[pos..].as_ptr() as *const DirEntry) };
-            if de.inode == 0 || de.rec_len == 0 {
+            if de.rec_len == 0 {
                 break;
             }
-            if de.name_len > 0 {
+            if de.inode == 0 {
+                // htree internal node or deleted entry — skip to next block boundary
+                let next_block = ((pos / self.block_size) + 1) * self.block_size;
+                if next_block >= size { break; }
+                pos = next_block;
+                continue;
+            }
+            if de.name_len > 0 && (pos + 8 + de.name_len as usize) <= data.len() {
                 let name = core::str::from_utf8(&data[pos + 8..pos + 8 + de.name_len as usize])
                     .unwrap_or("?");
                 entries.push((String::from(name), de.inode, de.file_type));
@@ -373,35 +379,56 @@ impl Ext4Fs {
     }
 
     fn lookup_with_depth(&self, path: &str, depth: usize) -> Result<u32, &'static str> {
+        self.lookup_from(EXT4_ROOT_INO, path, depth)
+    }
+
+    fn lookup_from(&self, start_ino: u32, path: &str, depth: usize) -> Result<u32, &'static str> {
         if depth > 8 {
             return Err("Too many symlinks");
         }
 
-        let path = path.trim_start_matches('/');
+        let path = if path.starts_with('/') {
+            // Absolute path: start from root
+            return self.lookup_from(EXT4_ROOT_INO, path.trim_start_matches('/'), depth);
+        } else {
+            path
+        };
+
         if path.is_empty() {
-            return Ok(EXT4_ROOT_INO);
+            return Ok(start_ino);
         }
 
-        let mut current_ino = EXT4_ROOT_INO;
-        for component in path.split('/') {
-            if component.is_empty() || component == "." { continue; }
-            if component == ".." {
-                // Stay at root for simplicity
+        let mut current_ino = start_ino;
+        let mut parent_ino = start_ino;
+        let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
+
+        for (idx, component) in components.iter().enumerate() {
+            if *component == ".." {
+                // For simplicity, go to root
+                current_ino = EXT4_ROOT_INO;
+                parent_ino = EXT4_ROOT_INO;
                 continue;
             }
             let entries = self.read_dir(current_ino)?;
-            let found = entries.iter().find(|(name, _, _)| name == component);
+            let found = entries.iter().find(|(name, _, _)| name == *component);
             match found {
                 Some((_, ino, ftype)) => {
+                    parent_ino = current_ino;
                     current_ino = *ino;
                     // Check if this is a symlink (ftype 7)
                     if *ftype == 7 {
                         let target = self.read_symlink(current_ino)?;
+                        log::debug!("ext4 symlink: {} -> {}", component, target);
                         if target.starts_with('/') {
-                            current_ino = self.lookup_with_depth(&target, depth + 1)?;
+                            current_ino = self.lookup_from(EXT4_ROOT_INO, target.trim_start_matches('/'), depth + 1)?;
                         } else {
-                            // Relative symlink: not fully supported yet
-                            current_ino = self.lookup_with_depth(&target, depth + 1)?;
+                            // Relative symlink: resolve from parent directory
+                            current_ino = self.lookup_from(parent_ino, &target, depth + 1)?;
+                        }
+                        // After following symlink, remaining components continue from resolved dir
+                        if idx + 1 < components.len() {
+                            let remaining: String = components[idx+1..].join("/");
+                            return self.lookup_from(current_ino, &remaining, depth);
                         }
                     }
                 }
@@ -438,7 +465,10 @@ impl Ext4Fs {
 
     /// Read a file by path
     pub fn read_file_by_path(&self, path: &str) -> Result<Vec<u8>, &'static str> {
-        let ino = self.lookup(path)?;
+        let ino = self.lookup(path).map_err(|e| {
+            log::debug!("ext4 lookup '{}': {}", path, e);
+            e
+        })?;
         self.read_file(ino)
     }
 

@@ -28,6 +28,14 @@ impl UserMemState {
 
 pub fn init() {}
 
+/// Set the brk base from the ELF loader (brk = end of BSS segment)
+pub fn set_brk_base(addr: usize) {
+    let mut state = USER_MEM.lock();
+    state.brk_base = addr;
+    state.brk_current = addr;
+    log::debug!("brk_base set to 0x{:x}", addr);
+}
+
 /// Allocate user virtual memory and map it in the active page table
 pub fn do_mmap(addr: usize, length: usize, prot: u32, flags: u32, fd: i32, offset: i64) -> SyscallResult {
     let aligned_len = (length + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);

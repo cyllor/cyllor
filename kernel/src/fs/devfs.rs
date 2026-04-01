@@ -32,10 +32,16 @@ pub fn init() {
         let input = Arc::new(Mutex::new(Inode::new_dir(0o755)));
         {
             let mut input_node = input.lock();
+            // event0 = keyboard (minor 64), event1 = mouse (minor 65)
             input_node.children.insert("event0".to_string(), Arc::new(Mutex::new(Inode::new_chardev(13, 64))));
+            input_node.children.insert("event1".to_string(), Arc::new(Mutex::new(Inode::new_chardev(13, 65))));
             input_node.children.insert("mice".to_string(), Arc::new(Mutex::new(Inode::new_chardev(13, 63))));
         }
         dev_node.children.insert("input".to_string(), input);
+        // /dev/ptmx — PTY master multiplexor (major 5, minor 2)
+        dev_node.children.insert("ptmx".to_string(), Arc::new(Mutex::new(Inode::new_chardev(5, 2))));
+        // /dev/pts directory (PTY slaves are opened via /dev/pts/N)
+        dev_node.children.insert("pts".to_string(), Arc::new(Mutex::new(Inode::new_dir(0o755))));
     }
     log::debug!("devfs populated");
 }

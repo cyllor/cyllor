@@ -132,6 +132,9 @@ impl AddressSpace {
         let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
         log::debug!("map_anon: virt=0x{:x} pages={} root=0x{:x}", virt_start, pages, self.root_phys);
         for i in 0..pages {
+            if pages > 100 && i % 512 == 0 {
+                crate::drivers::uart::write_byte(b'.');
+            }
             let phys = pmm::alloc_page().ok_or(())? as u64;
             // Zero the page
             let virt_phys = phys_to_virt(phys);

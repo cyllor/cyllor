@@ -30,3 +30,9 @@ pub fn do_kill(pid: i32, sig: i32) -> SyscallResult {
 pub fn do_tgkill(tgid: i32, tid: i32, sig: i32) -> SyscallResult {
     Ok(0)
 }
+
+/// Deliver a signal to all processes in a process group (stub).
+/// In a full implementation this would walk the process table.
+pub fn deliver_signal_to_pgrp(_pgrp: i32, _signum: i32) {
+    // TODO: iterate process table and deliver signal to matching pgrp
+}

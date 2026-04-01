@@ -131,9 +131,32 @@ impl Thread {
 
 pub struct Process {
     pub pid: Pid,
+    pub tgid: Pid,
+    pub ppid: Pid,
     pub name: String,
     pub threads: Vec<Pid>,
+    pub vmm: alloc::sync::Arc<Mutex<Vmm>>,
 }
+
+/// Minimal VMM stub for /proc/self/maps
+pub struct Vmm;
+
+impl Vmm {
+    pub fn maps_string(&self) -> String {
+        String::new()
+    }
+}
+
+/// Return the PID of the currently running process.
+/// (Simplified: always returns 1 until proper scheduler tracking is added.)
+pub fn current_pid() -> Pid {
+    1
+}
+
+/// Global process table — simplified placeholder.
+use alloc::collections::BTreeMap;
+use spin::Mutex;
+pub static PROCESS_TABLE: Mutex<BTreeMap<Pid, Process>> = Mutex::new(BTreeMap::new());
 
 /// Trampoline function: sets up EL0 return and does ERET
 /// Called as a "kernel thread" that immediately drops to user mode
@@ -158,14 +181,14 @@ unsafe extern "C" fn return_to_user_trampoline() -> ! {
         // Set user page table
         "msr TTBR0_EL1, x22",
         "isb",
-        "tlbi vmalle1is",
-        "dsb ish",
-        "isb",
 
         // Set up EL0 return
         "msr ELR_EL1, x19",
         "msr SPSR_EL1, x20",
-        "msr SP_EL0, x21",
+        // Set SP_EL0 via SPSel trick — msr SP_EL0 traps on QEMU cortex-a72
+        "msr SPSel, #0",
+        "mov sp, x21",
+        "msr SPSel, #1",
 
         // Clear all general purpose registers for clean userspace entry
         "mov x0, #0",

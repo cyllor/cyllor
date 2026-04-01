@@ -1,35 +1,37 @@
 use super::{SyscallResult, EBADF, ENOSYS, EINVAL};
 
 pub fn sys_write(fd: u64, buf: u64, count: u64) -> SyscallResult {
-    match fd as u32 {
-        1 | 2 => {
-            // stdout / stderr -> UART
-            // buf is a user virtual address — translate to physical via HHDM
-            // Read TTBR0_EL1 to get the current user page table
-            let ttbr0: u64;
-            unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
-            let hhdm = crate::arch::aarch64::hhdm_offset();
+    // Always translate user VA → kernel VA via page table walk
+    let ttbr0: u64;
+    unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0) };
+    let hhdm = crate::arch::aarch64::hhdm_offset();
 
-            // Walk page table manually to translate user VA to physical
-            match walk_user_page_table(ttbr0, buf, hhdm) {
-                Some(pa) => {
-                    let kva = pa + hhdm;
-                    let slice = unsafe { core::slice::from_raw_parts(kva as *const u8, count as usize) };
-                    for &b in slice {
-                        crate::drivers::uart::write_byte(b);
-                    }
-                    Ok(count as usize)
-                }
-                None => {
-                    crate::drivers::uart::early_print("[write: VA translation failed]\n");
-                    Err(super::EFAULT)
-                }
+    // Translate user buffer page-by-page and write
+    let mut written = 0usize;
+    let mut uaddr = buf;
+    while written < count as usize {
+        let pa = match walk_user_page_table(ttbr0, uaddr, hhdm) {
+            Some(pa) => pa,
+            None => return if written > 0 { Ok(written) } else { Err(super::EFAULT) },
+        };
+        let kva = pa + hhdm;
+        let page_remaining = 4096 - (kva & 0xFFF) as usize;
+        let chunk = page_remaining.min(count as usize - written);
+        let slice = unsafe { core::slice::from_raw_parts(kva as *const u8, chunk) };
+
+        // Write to fd
+        // Write to UART for fd 0/1/2, VFS for others
+        if fd <= 2 {
+            for &b in slice {
+                crate::drivers::uart::write_byte(b);
             }
+        } else {
+            let _ = crate::fs::fd_write(fd as u32, kva, chunk);
         }
-        _ => {
-            crate::fs::fd_write(fd as u32, buf, count as usize)
-        }
+        written += chunk;
+        uaddr += chunk as u64;
     }
+    Ok(written)
 }
 
 pub fn sys_read(fd: u64, buf: u64, count: u64) -> SyscallResult {
@@ -40,9 +42,7 @@ pub fn sys_openat(dirfd: i32, pathname: u64, flags: u32, mode: u32) -> SyscallRe
     let mut path_buf = [0u8; 256];
     let len = read_user_string(pathname, &mut path_buf)?;
     let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
-    // Fast path: try VFS, fall back to ENOENT
-    let result = crate::fs::openat(dirfd, path, flags, mode);
-    result
+    crate::fs::openat(dirfd, path, flags, mode)
 }
 
 /// Read a null-terminated string from user memory, demand-paging as needed
@@ -58,18 +58,8 @@ fn read_user_string(addr: u64, buf: &mut [u8]) -> Result<usize, i32> {
         let pa = match walk_user_page_table(ttbr0, uaddr, hhdm) {
             Some(pa) => pa,
             None => {
-                // Demand-page: allocate and map a zero page
-                let page = uaddr & !0xFFF;
-                let phys = crate::mm::pmm::alloc_page().ok_or(super::ENOMEM)? as u64;
-                unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096); }
-                crate::mm::mmap::map_page_in_ttbr0(
-                    l0_phys, page, phys,
-                    crate::arch::aarch64::paging::PageFlags::USER_RW, hhdm,
-                );
-                match walk_user_page_table(ttbr0, uaddr, hhdm) {
-                    Some(pa) => pa,
-                    None => return Err(super::EFAULT),
-                }
+                // Unmapped page — treat as NUL terminator (end of string)
+                break;
             }
         };
         let kva = pa + hhdm;
@@ -278,16 +268,23 @@ pub fn sys_readlinkat(dirfd: i32, pathname: u64, buf: u64, bufsiz: u32) -> Sysca
     let mut path_buf = [0u8; 256];
     let len = read_user_string(pathname, &mut path_buf)?;
     let path = core::str::from_utf8(&path_buf[..len]).unwrap_or("");
-    // /proc/self/exe -> return the running program name
-    if path == "/proc/self/exe" {
-        let exe = b"/bin/hello";
-        let len = (exe.len()).min(bufsiz as usize);
-        unsafe {
-            core::ptr::copy_nonoverlapping(exe.as_ptr(), buf as *mut u8, len);
+
+    // Use resolve_path_lstat to get the symlink inode without following it
+    match crate::fs::vfs::resolve_path_lstat(path) {
+        Ok(node) => {
+            let n = node.lock();
+            if n.itype == crate::fs::vfs::InodeType::Symlink {
+                let link_data = &n.data;
+                let copy_len = link_data.len().min(bufsiz as usize);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(link_data.as_ptr(), buf as *mut u8, copy_len);
+                }
+                return Ok(copy_len);
+            }
+            Err(EINVAL) // not a symlink
         }
-        return Ok(len);
+        Err(e) => Err(e),
     }
-    Err(super::EINVAL)
 }
 
 unsafe fn cstr_from_user(ptr: u64) -> Result<&'static str, i32> {

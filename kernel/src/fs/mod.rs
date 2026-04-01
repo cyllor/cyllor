@@ -36,12 +36,81 @@ pub fn fd_read(fd: u32, buf: u64, count: usize) -> SyscallResult {
 }
 
 pub fn openat(dirfd: i32, path: &str, flags: u32, mode: u32) -> SyscallResult {
-    // Try VFS first
+    // Special case: /dev/ptmx — allocate a new PTY pair
+    if path == "/dev/ptmx" || path == "/dev/pts/ptmx" {
+        let id = crate::drivers::pty::alloc_pty();
+        // Unlock immediately (glibc expects unlocked after open)
+        if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
+            pty_arc.lock().locked = false;
+        }
+        let file = Arc::new(Mutex::new(vfs::FileObject {
+            inode: None, offset: 0, flags,
+            ftype: vfs::FileType::PtyMaster,
+            special_data: Some(vfs::SpecialData::PtyMaster(id)),
+        }));
+        return fdtable::alloc_fd(file);
+    }
+
+    // Special case: /dev/pts/N — open PTY slave
+    if path.starts_with("/dev/pts/") {
+        if let Ok(id) = path[9..].parse::<u32>() {
+            if crate::drivers::pty::get_pty(id).is_some() {
+                let file = Arc::new(Mutex::new(vfs::FileObject {
+                    inode: None, offset: 0, flags,
+                    ftype: vfs::FileType::PtySlave,
+                    special_data: Some(vfs::SpecialData::PtySlave(id)),
+                }));
+                return fdtable::alloc_fd(file);
+            }
+        }
+        return Err(crate::syscall::ENOENT);
+    }
+
+    // Try VFS
     if let Ok(node) = vfs::resolve_path(path) {
+        // Check if this is /dev/ptmx chardev (5, 2)
+        {
+            let n = node.lock();
+            if n.itype == vfs::InodeType::CharDevice && n.dev_major == 5 && n.dev_minor == 2 {
+                drop(n);
+                let id = crate::drivers::pty::alloc_pty();
+                if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
+                    pty_arc.lock().locked = false;
+                }
+                let file = Arc::new(Mutex::new(vfs::FileObject {
+                    inode: Some(node.clone()), offset: 0, flags,
+                    ftype: vfs::FileType::PtyMaster,
+                    special_data: Some(vfs::SpecialData::PtyMaster(id)),
+                }));
+                return fdtable::alloc_fd(file);
+            }
+        }
         let file = vfs::open_node(node, flags)?;
         return fdtable::alloc_fd(file);
     }
+
     Err(crate::syscall::ENOENT)
+}
+
+fn ensure_vfs_parents(path: &str) {
+    let parts: alloc::vec::Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut current = alloc::string::String::new();
+    for part in parts {
+        current.push('/');
+        current.push_str(part);
+        if vfs::resolve_path(&current).is_err() {
+            // Create directory
+            if let Some(slash) = current.rfind('/') {
+                let parent_path = if slash == 0 { "/" } else { &current[..slash] };
+                let dirname = &current[slash+1..];
+                if let Ok(parent) = vfs::resolve_path(parent_path) {
+                    let mut pn = parent.lock();
+                    pn.children.insert(alloc::string::String::from(dirname),
+                        Arc::new(Mutex::new(vfs::Inode::new_dir(0o755))));
+                }
+            }
+        }
+    }
 }
 
 pub fn close(fd: u32) -> SyscallResult {

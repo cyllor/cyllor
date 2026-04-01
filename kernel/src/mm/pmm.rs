@@ -55,12 +55,24 @@ pub fn init() {
     let mut pmm = PMM.lock();
     let mut total = 0usize;
 
+    // Only use pages that are covered by Limine's HHDM mapping.
+    // QEMU virt with -m 1G may have usable memory above 1 GB (UEFI layout),
+    // but Limine's TTBR1 HHDM typically only maps contiguous physical RAM.
+    // We limit to 2 GB to be safe — adjust if needed for larger RAM configs.
+    const MAX_PHYS: usize = 2 * 1024 * 1024 * 1024; // 2 GB
+
     for entry in entries {
         if entry.type_ == MEMMAP_USABLE {
             let base = entry.base as usize;
             let len = entry.length as usize;
+            let end = base + len;
+            if end > MAX_PHYS {
+                log::warn!("PMM: skipping region 0x{:x}-0x{:x} (above HHDM limit)", base, end);
+                if base >= MAX_PHYS { continue; }
+            }
+            let usable_end = end.min(MAX_PHYS);
             let start_page = base / PAGE_SIZE;
-            let page_count = len / PAGE_SIZE;
+            let page_count = (usable_end - base) / PAGE_SIZE;
 
             for p in start_page..start_page + page_count {
                 if p < MAX_PAGES {
