@@ -82,7 +82,7 @@ pub fn init_distributor() {
 // ---------- Redistributor (per-CPU) ----------
 
 pub fn init_redistributor() {
-    let cpu_id = cpu_id();
+    let cpu_id = crate::sched::cpu::current_cpu_id();
     let rd = gicr_rd_base(cpu_id);
     let sgi = gicr_sgi_base(cpu_id);
 
@@ -112,7 +112,7 @@ pub fn init_redistributor() {
 /// Simplified redistributor init that skips GICR_WAKER entirely.
 /// Use this for AP cores where the redistributor may already be awake.
 pub fn init_redistributor_ap() {
-    let cpu_id = cpu_id();
+    let cpu_id = crate::sched::cpu::current_cpu_id();
     let sgi = gicr_sgi_base(cpu_id);
 
     unsafe {
@@ -178,7 +178,7 @@ pub fn send_sgi(target_cpu: usize, sgi_id: u32) {
 pub fn enable_irq(intid: u32) {
     if intid < 32 {
         // SGI / PPI — per-CPU, via redistributor
-        let sgi = gicr_sgi_base(cpu_id());
+        let sgi = gicr_sgi_base(crate::sched::cpu::current_cpu_id());
         unsafe { write32(sgi + GICR_ISENABLER0, 1 << intid) };
     } else {
         // SPI — shared, via distributor
@@ -192,7 +192,7 @@ pub fn enable_irq(intid: u32) {
 #[allow(dead_code)]
 pub fn disable_irq(intid: u32) {
     if intid < 32 {
-        let sgi = gicr_sgi_base(cpu_id());
+        let sgi = gicr_sgi_base(crate::sched::cpu::current_cpu_id());
         unsafe { write32(sgi + GICR_ICENABLER0, 1 << intid) };
     } else {
         let reg = (intid / 32) as usize;
@@ -203,8 +203,3 @@ pub fn disable_irq(intid: u32) {
 
 // ---------- Helpers ----------
 
-fn cpu_id() -> usize {
-    let mpidr: u64;
-    unsafe { asm!("mrs {}, MPIDR_EL1", out(reg) mpidr) };
-    (mpidr & 0xFF) as usize
-}

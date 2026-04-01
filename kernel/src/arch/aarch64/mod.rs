@@ -3,6 +3,7 @@ extern crate alloc;
 use crate::arch::Arch;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+pub mod context;
 pub mod exceptions;
 pub mod gic;
 pub mod paging;

@@ -3,21 +3,14 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::arch::aarch64::paging::{AddressSpace, PageFlags};
-use crate::mm::pmm;
+use goblin::elf64::header::{Header, EM_AARCH64, ET_DYN};
+use goblin::elf64::program_header::{ProgramHeader, PT_LOAD, PT_INTERP, PT_PHDR, PF_X, PF_W, PF_R};
+use crate::arch::{AddressSpace, PageFlags};
 
 const PAGE_SIZE: usize = 4096;
-
-// ELF constants
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-const ET_EXEC: u16 = 2;
-const ET_DYN: u16 = 3;
-const PT_LOAD: u32 = 1;
-const PT_INTERP: u32 = 3;
-const PT_PHDR: u32 = 6;
-const PF_X: u32 = 1;
-const PF_W: u32 = 2;
-const PF_R: u32 = 4;
+
+// Auxiliary vector types
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
@@ -26,43 +19,8 @@ const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
 const AT_UID: u64 = 11;
-const AT_EUID: u64 = 12;
 const AT_GID: u64 = 13;
-const AT_EGID: u64 = 14;
 const AT_RANDOM: u64 = 25;
-const AT_EXECFN: u64 = 31;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct Elf64Ehdr {
-    pub e_ident: [u8; 16],
-    pub e_type: u16,
-    pub e_machine: u16,
-    pub e_version: u32,
-    pub e_entry: u64,
-    pub e_phoff: u64,
-    pub e_shoff: u64,
-    pub e_flags: u32,
-    pub e_ehsize: u16,
-    pub e_phentsize: u16,
-    pub e_phnum: u16,
-    pub e_shentsize: u16,
-    pub e_shnum: u16,
-    pub e_shstrndx: u16,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct Elf64Phdr {
-    pub p_type: u32,
-    pub p_flags: u32,
-    pub p_offset: u64,
-    pub p_vaddr: u64,
-    pub p_paddr: u64,
-    pub p_filesz: u64,
-    pub p_memsz: u64,
-    pub p_align: u64,
-}
 
 pub struct ElfLoadResult {
     pub entry: u64,           // Entry point (might be interp's entry)
@@ -72,34 +30,25 @@ pub struct ElfLoadResult {
     pub phnum: u16,           // Number of program headers
     pub exe_entry: u64,       // Original executable entry point
     pub stack_top: u64,       // Top of user stack
-    pub brk_start: u64,      // Start of data segment (for brk)
+    pub brk_start: u64,       // Start of data segment (for brk)
 }
 
 /// Load an ELF binary into the given address space
 pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'static str> {
-    if data.len() < core::mem::size_of::<Elf64Ehdr>() {
+    if data.len() < core::mem::size_of::<Header>() {
         return Err("ELF too small");
     }
+    let ehdr = unsafe { &*(data.as_ptr() as *const Header) };
+    if ehdr.e_ident[0..4] != ELF_MAGIC { return Err("Bad ELF magic"); }
+    if ehdr.e_ident[4] != 2 { return Err("Not ELF64"); }
+    if ehdr.e_machine != EM_AARCH64 as u16 { return Err("Not AArch64"); }
 
-    let ehdr = unsafe { &*(data.as_ptr() as *const Elf64Ehdr) };
-
-    // Validate
-    if ehdr.e_ident[0..4] != ELF_MAGIC {
-        return Err("Bad ELF magic");
-    }
-    if ehdr.e_ident[4] != 2 {
-        return Err("Not ELF64");
-    }
-    if ehdr.e_machine != 183 {
-        return Err("Not AArch64");
-    }
-
-    let is_pie = ehdr.e_type == ET_DYN;
+    let is_pie = ehdr.e_type == ET_DYN as u16;
     let load_bias: u64 = if is_pie { 0x0000_0040_0000 } else { 0 };
 
     let phdrs = unsafe {
         core::slice::from_raw_parts(
-            data.as_ptr().add(ehdr.e_phoff as usize) as *const Elf64Phdr,
+            data.as_ptr().add(ehdr.e_phoff as usize) as *const ProgramHeader,
             ehdr.e_phnum as usize,
         )
     };
@@ -112,7 +61,6 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
             let end = start + phdr.p_filesz as usize;
             if end <= data.len() {
                 let path_bytes = &data[start..end];
-                // Strip trailing null
                 let len = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
                 if let Ok(s) = core::str::from_utf8(&path_bytes[..len]) {
                     interp_path = Some(String::from(s));
@@ -133,38 +81,30 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
             let map_size = (aligned_end - aligned_start) as usize;
 
             let flags = phdr_to_pageflags(phdr.p_flags);
-            // Map with final permissions - data is copied via HHDM (kernel virtual)
             aspace.map_anon(aligned_start, map_size, flags)
                 .map_err(|_| "Failed to map segment")?;
 
-            // Copy file data
             if phdr.p_filesz > 0 {
                 let file_data = &data[phdr.p_offset as usize..(phdr.p_offset + phdr.p_filesz) as usize];
                 aspace.copy_to_user(vaddr, file_data)
                     .map_err(|_| "Failed to copy segment data")?;
             }
 
-            // Track highest address for brk
             let seg_end = vaddr + phdr.p_memsz;
-            if seg_end > brk_end {
-                brk_end = seg_end;
-            }
+            if seg_end > brk_end { brk_end = seg_end; }
         }
-
         if phdr.p_type == PT_PHDR {
             phdr_addr = phdr.p_vaddr + load_bias;
         }
     }
 
-    // If no PT_PHDR, calculate from ehdr
     if phdr_addr == 0 {
-        // Place phdrs after load segments
         phdr_addr = load_bias + ehdr.e_phoff;
     }
 
     let brk_start = (brk_end + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
 
-    // Set up user stack (8 MiB at top of user space)
+    // Map user stack (8 MiB)
     let stack_size: usize = 8 * 1024 * 1024;
     let stack_top: u64 = 0x0000_7FFF_FFFF_0000;
     let stack_bottom = stack_top - stack_size as u64;
@@ -177,36 +117,32 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
 
     if let Some(ref path) = interp_path {
         log::debug!("ELF interpreter: {}", path);
-        // Try to read interpreter from VFS
         match crate::fs::vfs::resolve_path(path) {
             Ok(node) => {
                 let interp_data = node.lock().data.clone();
                 if !interp_data.is_empty() {
-                    // Load interpreter at a fixed high address
-                    let ld_base: u64 = 0x0000_0050_0000_0000; // 320 GiB
-                    let ld_result = load_interp(&interp_data, aspace, ld_base)?;
+                    let ld_base: u64 = 0x0000_0050_0000_0000;
+                    let ld_entry = load_interp(&interp_data, aspace, ld_base)?;
                     interp_base = ld_base;
-                    final_entry = ld_result.entry;
+                    final_entry = ld_entry;
                     let h = crate::arch::aarch64::hhdm_offset();
                     let l0p = (aspace.root_phys + h) as *const u64;
                     let l0a = unsafe { core::ptr::read_volatile(l0p.add(0xA)) };
-                    log::info!("VFS interp: L0[0xA]=0x{:x} entry=0x{:x}", l0a, ld_result.entry);
+                    log::info!("VFS interp: L0[0xA]=0x{:x} entry=0x{:x}", l0a, ld_entry);
                 }
             }
             Err(_) => {
-                // Try ext4
                 match crate::fs::ext4::read_file(path) {
                     Ok(interp_data) => {
                         let ld_base: u64 = 0x0000_0050_0000_0000;
-                        let ld_result = load_interp(&interp_data, aspace, ld_base)?;
+                        let ld_entry = load_interp(&interp_data, aspace, ld_base)?;
                         interp_base = ld_base;
-                        final_entry = ld_result.entry;
-                        // Verify the interp pages are actually mapped
+                        final_entry = ld_entry;
                         let hhdm_off = crate::arch::aarch64::hhdm_offset();
                         let l0 = (aspace.root_phys + hhdm_off) as *const u64;
                         let l0_a = unsafe { core::ptr::read_volatile(l0.add(0xA)) };
                         log::info!("After load_interp: L0[0xA] = 0x{:x}", l0_a);
-                        log::info!("Loaded interpreter at 0x{:x}, entry=0x{:x}", ld_base, ld_result.entry);
+                        log::info!("Loaded interpreter at 0x{:x}, entry=0x{:x}", ld_base, ld_entry);
                     }
                     Err(_) => {
                         log::warn!("Interpreter {} not found, trying static", path);
@@ -231,8 +167,8 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
     })
 }
 
-/// Build the initial user stack with argv, envp, and auxval
-/// Returns the new stack pointer
+/// Build the initial user stack with argv, envp, and auxval.
+/// Returns the new stack pointer.
 pub fn setup_user_stack(
     aspace: &AddressSpace,
     stack_top: u64,
@@ -240,42 +176,26 @@ pub fn setup_user_stack(
     envp: &[&[u8]],
     elf_result: &ElfLoadResult,
 ) -> Result<u64, &'static str> {
-    // Stack layout (grows down):
-    // [padding/alignment]
-    // [AT_RANDOM 16 bytes]
-    // [environment strings]
-    // [argument strings]
-    // [auxv entries] (pairs of u64)
-    // [NULL] (end of envp)
-    // [envp pointers]
-    // [NULL] (end of argv)
-    // [argv pointers]
-    // [argc]   <-- sp points here
-
     let mut sp = stack_top;
 
-    // Helper: push bytes to stack
     let push_bytes = |sp: &mut u64, data: &[u8], aspace: &AddressSpace| -> Result<u64, &'static str> {
         *sp -= data.len() as u64;
         aspace.copy_to_user(*sp, data).map_err(|_| "stack write failed")?;
         Ok(*sp)
     };
 
-    // Helper: push u64
     let push_u64 = |sp: &mut u64, val: u64, aspace: &AddressSpace| -> Result<(), &'static str> {
         *sp -= 8;
         aspace.copy_to_user(*sp, &val.to_le_bytes()).map_err(|_| "stack write failed")?;
         Ok(())
     };
 
-    // Align to 16 bytes
     sp &= !0xF;
 
-    // Push AT_RANDOM data (16 random bytes)
+    // AT_RANDOM: 16 bytes of pseudo-random data
     sp -= 16;
     let random_addr = sp;
     let mut random_data = [0u8; 16];
-    // Simple PRNG
     let mut seed: u64 = 0;
     unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) seed) };
     for b in random_data.iter_mut() {
@@ -284,11 +204,10 @@ pub fn setup_user_stack(
     }
     aspace.copy_to_user(random_addr, &random_data).map_err(|_| "stack write")?;
 
-    // Push environment strings, save pointers
     let mut env_ptrs = Vec::new();
     for env in envp.iter().rev() {
-        sp -= env.len() as u64 + 1; // +1 for null terminator
-        sp &= !0x7; // align
+        sp -= env.len() as u64 + 1;
+        sp &= !0x7;
         let mut buf = env.to_vec();
         buf.push(0);
         aspace.copy_to_user(sp, &buf).map_err(|_| "env write")?;
@@ -296,7 +215,6 @@ pub fn setup_user_stack(
     }
     env_ptrs.reverse();
 
-    // Push argument strings, save pointers
     let mut arg_ptrs = Vec::new();
     for arg in argv.iter().rev() {
         sp -= arg.len() as u64 + 1;
@@ -308,16 +226,12 @@ pub fn setup_user_stack(
     }
     arg_ptrs.reverse();
 
-    // Align stack to 16 bytes
     sp &= !0xF;
 
-    // Calculate total items to push to determine alignment
-    let total_items = 1 + arg_ptrs.len() + 1 + env_ptrs.len() + 1 + 2 * 10 + 2; // argc + argv + null + envp + null + auxv
-    if total_items % 2 != 0 {
-        sp -= 8; // Extra alignment padding
-    }
+    let total_items = 1 + arg_ptrs.len() + 1 + env_ptrs.len() + 1 + 2 * 10 + 2;
+    if total_items % 2 != 0 { sp -= 8; }
 
-    // Push auxiliary vector (in reverse)
+    // Auxiliary vector
     push_u64(&mut sp, 0, aspace)?; push_u64(&mut sp, AT_NULL, aspace)?;
     push_u64(&mut sp, random_addr, aspace)?; push_u64(&mut sp, AT_RANDOM, aspace)?;
     push_u64(&mut sp, PAGE_SIZE as u64, aspace)?; push_u64(&mut sp, AT_PAGESZ, aspace)?;
@@ -329,47 +243,33 @@ pub fn setup_user_stack(
     push_u64(&mut sp, 0, aspace)?; push_u64(&mut sp, AT_UID, aspace)?;
     push_u64(&mut sp, 0, aspace)?; push_u64(&mut sp, AT_GID, aspace)?;
 
-    // Push NULL (end of envp)
     push_u64(&mut sp, 0, aspace)?;
+    for ptr in env_ptrs.iter().rev() { push_u64(&mut sp, *ptr, aspace)?; }
 
-    // Push envp pointers
-    for ptr in env_ptrs.iter().rev() {
-        push_u64(&mut sp, *ptr, aspace)?;
-    }
-
-    // Push NULL (end of argv)
     push_u64(&mut sp, 0, aspace)?;
+    for ptr in arg_ptrs.iter().rev() { push_u64(&mut sp, *ptr, aspace)?; }
 
-    // Push argv pointers
-    for ptr in arg_ptrs.iter().rev() {
-        push_u64(&mut sp, *ptr, aspace)?;
-    }
-
-    // Push argc
     push_u64(&mut sp, argv.len() as u64, aspace)?;
 
     Ok(sp)
 }
 
-/// Load an ELF interpreter (ld-linux) at a given base address
-fn load_interp(data: &[u8], aspace: &AddressSpace, base: u64) -> Result<InterpResult, &'static str> {
-    if data.len() < core::mem::size_of::<Elf64Ehdr>() {
+/// Load an ELF interpreter (ld-linux) at a given base address.
+/// Returns the interpreter entry point.
+fn load_interp(data: &[u8], aspace: &AddressSpace, base: u64) -> Result<u64, &'static str> {
+    if data.len() < core::mem::size_of::<Header>() {
         return Err("Interpreter ELF too small");
     }
-
-    let ehdr = unsafe { &*(data.as_ptr() as *const Elf64Ehdr) };
-    if ehdr.e_ident[0..4] != ELF_MAGIC {
-        return Err("Interpreter: bad ELF magic");
-    }
+    let ehdr = unsafe { &*(data.as_ptr() as *const Header) };
+    if ehdr.e_ident[0..4] != ELF_MAGIC { return Err("Interpreter: bad ELF magic"); }
 
     let phdrs = unsafe {
         core::slice::from_raw_parts(
-            data.as_ptr().add(ehdr.e_phoff as usize) as *const Elf64Phdr,
+            data.as_ptr().add(ehdr.e_phoff as usize) as *const ProgramHeader,
             ehdr.e_phnum as usize,
         )
     };
 
-    // Find the lowest vaddr to compute the load bias
     let mut min_vaddr = u64::MAX;
     for phdr in phdrs {
         if phdr.p_type == PT_LOAD && phdr.p_vaddr < min_vaddr {
@@ -398,13 +298,7 @@ fn load_interp(data: &[u8], aspace: &AddressSpace, base: u64) -> Result<InterpRe
         }
     }
 
-    Ok(InterpResult {
-        entry: ehdr.e_entry + load_bias,
-    })
-}
-
-struct InterpResult {
-    entry: u64,
+    Ok(ehdr.e_entry + load_bias)
 }
 
 fn phdr_to_pageflags(p_flags: u32) -> PageFlags {

@@ -123,7 +123,7 @@ unsafe extern "C" {
 
 pub fn init() {
     unsafe {
-        let tbl = exception_vector_table as usize as u64;
+        let tbl = exception_vector_table as *const () as usize as u64;
         core::arch::asm!(
             "msr VBAR_EL1, {0}",
             "isb",
@@ -151,21 +151,16 @@ extern "C" fn irq_handler_rust(_frame: *mut TrapFrame) {
         gic::TIMER_IRQ => {
             timer::reset();
             TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            // Per-CPU tick counter
-            let cpu = cpu_id();
+            let cpu = crate::sched::cpu::current_cpu_id();
             if cpu < 4 {
                 super::PER_CPU_TICKS[cpu].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
-            // Only BSP runs the scheduler (Phase 1)
-            if cpu == 0 {
-                crate::sched::timer_tick();
-            }
+            // All CPUs participate in scheduling.
+            crate::sched::timer_tick();
         }
         gic::SGI_RESCHEDULE => {
-            // Phase 1: ignore SGI on APs
-            if cpu_id() == 0 {
-                crate::sched::timer_tick();
-            }
+            // Reschedule IPI: wake this CPU from idle and pick up work.
+            crate::sched::timer_tick();
         }
         gic::UART0_IRQ => {
             crate::drivers::uart::handle_rx_interrupt();
@@ -176,11 +171,6 @@ extern "C" fn irq_handler_rust(_frame: *mut TrapFrame) {
     gic::end_interrupt(intid);
 }
 
-fn cpu_id() -> usize {
-    let mpidr: u64;
-    unsafe { core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr) };
-    (mpidr & 0xFF) as usize
-}
 
 #[unsafe(no_mangle)]
 extern "C" fn lower_irq_handler_rust(_frame: *mut TrapFrame) {
@@ -189,18 +179,14 @@ extern "C" fn lower_irq_handler_rust(_frame: *mut TrapFrame) {
         gic::TIMER_IRQ => {
             timer::reset();
             TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let cpu = cpu_id();
+            let cpu = crate::sched::cpu::current_cpu_id();
             if cpu < 4 {
                 super::PER_CPU_TICKS[cpu].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
-            if cpu == 0 {
-                crate::sched::timer_tick();
-            }
+            crate::sched::timer_tick();
         }
         gic::SGI_RESCHEDULE => {
-            if cpu_id() == 0 {
-                crate::sched::timer_tick();
-            }
+            crate::sched::timer_tick();
         }
         gic::UART0_IRQ => {
             crate::drivers::uart::handle_rx_interrupt();

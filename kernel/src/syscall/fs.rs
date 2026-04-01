@@ -183,7 +183,7 @@ pub fn copy_to_user(user_addr: u64, data: &[u8]) -> Result<(), i32> {
                 let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
                 crate::mm::mmap::map_page_in_ttbr0(
                     l0_phys, page_addr, phys,
-                    crate::arch::aarch64::paging::PageFlags::USER_RW, hhdm,
+                    crate::arch::PageFlags::USER_RW, hhdm,
                 );
                 // Retry this offset
             }

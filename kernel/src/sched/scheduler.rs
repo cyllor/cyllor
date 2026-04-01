@@ -1,8 +1,8 @@
 use super::process::{Thread, ThreadState, Pid, Context};
+use super::cpu;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use spin::Mutex;
-use core::arch::global_asm;
 
 pub static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 
@@ -35,152 +35,190 @@ pub fn init(num_cpus: usize) {
     log::info!("Scheduler initialized for {num_cpus} CPUs");
 }
 
+/// Return the index of the CPU with the fewest Ready threads.
+pub fn least_loaded_cpu(sched: &Scheduler) -> usize {
+    (0..sched.num_cpus)
+        .min_by_key(|&c| {
+            sched.run_queues[c]
+                .iter()
+                .filter(|t| t.state == ThreadState::Ready)
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 pub fn spawn_kernel_thread(name: &str, entry: fn()) -> Pid {
     let thread = Thread::new_kernel(name, entry);
     let pid = thread.pid;
     let target_cpu;
     {
         let mut sched = SCHEDULER.lock();
-        if sched.run_queues.is_empty() {
-            return pid;
-        }
-        // Phase 1: all tasks on BSP (CPU 0) only
-        target_cpu = 0;
+        if sched.run_queues.is_empty() { return pid; }
+        target_cpu = least_loaded_cpu(&sched);
         sched.run_queues[target_cpu].push_back(thread);
     }
-    // TODO Phase 3: send_resched_ipi(target_cpu) when target != current
+    if target_cpu != cpu::current_cpu_id() {
+        send_resched_ipi(target_cpu);
+    }
     log::debug!("Spawned kernel thread '{name}' (PID {pid}) on CPU {target_cpu}");
     pid
 }
 
-/// Schedule on the current CPU. Called from timer_tick and SGI handler.
+/// Schedule on the current CPU.
+/// Called from `timer_tick()` (timer interrupt) and SGI handler (resched IPI).
 pub fn schedule() {
-    let cpu_id = current_cpu_id();
+    let cpu_id = cpu::current_cpu_id();
 
-    // Determine what to switch under the lock, perform the actual switch outside.
     let switch_info: Option<(*mut Context, *const Context, bool, Option<u64>)> = {
         let mut sched = SCHEDULER.lock();
         if !sched.initialized || cpu_id >= sched.num_cpus {
             return;
         }
 
-        // Find next thread for this CPU (Phase 1: no work stealing)
-        let next = sched.run_queues[cpu_id].pop_front();
+        // Increment the running thread's vruntime (time-slice accounting).
+        if let Some(curr) = sched.current[cpu_id].as_mut() {
+            if curr.pid != 0 {
+                curr.vruntime = curr.vruntime.saturating_add(1);
+            }
+        }
 
-        let mut next = match next {
-            Some(t) => t,
-            None => return, // Nothing to run, stay idle
+        // ── Pick next thread ────────────────────────────────────────────────
+        // 1. Local queue: CFS-like — choose Ready thread with minimum vruntime.
+        let local_next = {
+            let idx = sched.run_queues[cpu_id]
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.state == ThreadState::Ready)
+                .min_by_key(|(_, t)| t.vruntime)
+                .map(|(i, _)| i);
+            idx.and_then(|i| sched.run_queues[cpu_id].remove(i))
         };
 
+        // 2. Work-stealing: if local queue has nothing runnable, steal one
+        //    thread from the busiest remote CPU (only if victim has > 1 Ready).
+        let next = local_next.or_else(|| {
+            let num_cpus = sched.num_cpus;
+            let victim = (0..num_cpus)
+                .filter(|&c| c != cpu_id)
+                .max_by_key(|&c| {
+                    sched.run_queues[c]
+                        .iter()
+                        .filter(|t| t.state == ThreadState::Ready)
+                        .count()
+                });
+            victim.and_then(|v| {
+                let ready = sched.run_queues[v]
+                    .iter()
+                    .filter(|t| t.state == ThreadState::Ready)
+                    .count();
+                if ready > 1 {
+                    // Steal the last Ready thread (back of victim's queue).
+                    let steal_idx = sched.run_queues[v]
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, t)| t.state == ThreadState::Ready)
+                        .map(|(i, _)| i);
+                    steal_idx.and_then(|i| sched.run_queues[v].remove(i))
+                } else {
+                    None
+                }
+            })
+        });
+
+        // Nothing runnable — stay on the current thread.
+        let mut next = match next {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Take the currently running thread out of current[].
         let mut current = match sched.current[cpu_id].take() {
             Some(t) => t,
             None => return,
         };
 
-        // For user threads on first run, set trampoline registers
-        if next.is_user && next.state == ThreadState::Ready {
-            next.context.x19 = next.context.elr;     // entry point
-            next.context.x20 = next.context.spsr;    // SPSR (EL0t = 0)
-            next.context.x21 = next.context.sp_el0;  // user stack
-            next.context.x22 = next.context.ttbr0;   // page table
+        // First-run setup for user threads: load entry/spsr/sp_el0/ttbr0 into
+        // x19-x22 so return_to_user_trampoline can ERET to EL0.
+        if next.is_user && next.first_run {
+            next.context.x19 = next.context.elr;
+            next.context.x20 = next.context.spsr;
+            next.context.x21 = next.context.sp_el0;
+            next.context.x22 = next.context.ttbr0;
+            next.first_run = false;
         }
 
-        // Extract TTBR0 to switch OUTSIDE the lock (avoids tlbi+dsb stall under spinlock)
         let ttbr0 = if next.is_user { Some(next.context.ttbr0) } else { None };
+        let next_pid = next.pid;
+        next.state = ThreadState::Running;
 
         if current.pid == 0 {
-            // Idle → task: just replace, no context to save
-            next.state = ThreadState::Running;
+            // Idle → new thread: just restore new context, nothing to save.
             sched.current[cpu_id] = Some(next);
-            let ctx_ptr = &sched.current[cpu_id].as_ref().unwrap().context as *const Context;
-            Some((core::ptr::null_mut::<Context>(), ctx_ptr, true, ttbr0))
+            cpu::set_current_pid(cpu_id, next_pid);
+            let ctx = &sched.current[cpu_id].as_ref().unwrap().context as *const Context;
+            Some((core::ptr::null_mut(), ctx, true, ttbr0))
         } else {
+            // Re-queue the previous thread.
+            // If it was Running, demote to Ready.  If Blocked, keep Blocked so
+            // wait::tick() can find and wake it later.
             if current.state == ThreadState::Running {
                 current.state = ThreadState::Ready;
             }
-            next.state = ThreadState::Running;
-
             sched.run_queues[cpu_id].push_back(current);
             sched.current[cpu_id] = Some(next);
+            cpu::set_current_pid(cpu_id, next_pid);
 
-            let current_ctx = &mut sched.run_queues[cpu_id].back_mut().unwrap().context as *mut Context;
-            let next_ctx = &sched.current[cpu_id].as_ref().unwrap().context as *const Context;
-            Some((current_ctx, next_ctx, false, ttbr0))
+            let old_ctx =
+                &mut sched.run_queues[cpu_id].back_mut().unwrap().context as *mut Context;
+            let new_ctx =
+                &sched.current[cpu_id].as_ref().unwrap().context as *const Context;
+            Some((old_ctx, new_ctx, false, ttbr0))
         }
-    };
-    // Lock is now released.
+    }; // Scheduler lock released.
 
-    if let Some((old_ctx, new_ctx, is_idle_to_user, ttbr0)) = switch_info {
-        // Switch TTBR0 outside the lock — TLB broadcast won't stall other cores' lock acquisition
+    if let Some((old_ctx, new_ctx, is_idle_to_new, ttbr0)) = switch_info {
+        // Switch the user page table outside the lock to avoid TLB broadcast
+        // stalling other CPUs' lock acquisitions.
         if let Some(t) = ttbr0 {
             unsafe {
-                core::arch::asm!(
-                    "msr TTBR0_EL1, {0}",
-                    "isb",
-                    in(reg) t,
-                );
+                core::arch::asm!("msr TTBR0_EL1, {0}", "isb", in(reg) t);
             }
         }
-
-        if is_idle_to_user {
-            unsafe { switch_to_new(new_ctx); }
+        if is_idle_to_new {
+            unsafe { crate::arch::aarch64::context::switch_to_new_asm(new_ctx); }
         } else if !old_ctx.is_null() {
-            unsafe { context_switch(old_ctx, new_ctx); }
+            unsafe { crate::arch::aarch64::context::context_switch_asm(old_ctx, new_ctx); }
         }
     }
 }
 
-fn current_cpu_id() -> usize {
-    let mpidr: u64;
-    unsafe { core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr) };
-    (mpidr & 0xFF) as usize
+/// Mark the current thread Blocked until `wake_tick`, then yield.
+/// Returns once the thread has been woken and rescheduled.
+pub fn block_current_until(wake_tick: u64) {
+    let cpu_id = cpu::current_cpu_id();
+    let pid = cpu::get_current_pid();
+
+    {
+        let mut sched = SCHEDULER.lock();
+        if let Some(curr) = sched.current[cpu_id].as_mut() {
+            curr.state = ThreadState::Blocked;
+        }
+    }
+
+    // Register wakeup outside the scheduler lock (wait has its own lock).
+    super::wait::register_wakeup(pid, wake_tick);
+
+    // Yield — schedule() re-queues us as Blocked; we resume when woken.
+    schedule();
 }
 
-/// Send a reschedule IPI to wake another CPU from idle.
+/// Send a reschedule SGI to wake an idle CPU.
 pub fn send_resched_ipi(target_cpu: usize) {
     #[cfg(target_arch = "aarch64")]
-    crate::arch::aarch64::gic::send_sgi(target_cpu, crate::arch::aarch64::gic::SGI_RESCHEDULE);
+    crate::arch::aarch64::gic::send_sgi(
+        target_cpu,
+        crate::arch::aarch64::gic::SGI_RESCHEDULE,
+    );
 }
 
-// Context switch: save old callee-saved regs, restore new ones, ret
-global_asm!(
-    ".global context_switch",
-    "context_switch:",
-    "stp x19, x20, [x0, #0]",
-    "stp x21, x22, [x0, #16]",
-    "stp x23, x24, [x0, #32]",
-    "stp x25, x26, [x0, #48]",
-    "stp x27, x28, [x0, #64]",
-    "stp x29, x30, [x0, #80]",
-    "mov x2, sp",
-    "str x2, [x0, #96]",
-
-    "ldp x19, x20, [x1, #0]",
-    "ldp x21, x22, [x1, #16]",
-    "ldp x23, x24, [x1, #32]",
-    "ldp x25, x26, [x1, #48]",
-    "ldp x27, x28, [x1, #64]",
-    "ldp x29, x30, [x1, #80]",
-    "ldr x2, [x1, #96]",
-    "mov sp, x2",
-    "ret",
-
-    // switch_to_new: just restore new context registers and jump
-    ".global switch_to_new",
-    "switch_to_new:",
-    "mov x1, x0",   // x0 = new_ctx, move to x1 for consistency
-    "ldp x19, x20, [x1, #0]",
-    "ldp x21, x22, [x1, #16]",
-    "ldp x23, x24, [x1, #32]",
-    "ldp x25, x26, [x1, #48]",
-    "ldp x27, x28, [x1, #64]",
-    "ldp x29, x30, [x1, #80]",
-    "ldr x2, [x1, #96]",
-    "mov sp, x2",
-    "ret",
-);
-
-unsafe extern "C" {
-    pub fn context_switch(old: *mut Context, new: *const Context);
-    pub fn switch_to_new(new: *const Context);
-}

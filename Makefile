@@ -15,6 +15,18 @@ IMG = target/cyllor-$(ARCH).img
 
 LIMINE_DIR = target/limine
 
+# QEMU UEFI firmware — auto-detect Windows (MSYS2/MinGW) vs macOS
+UNAME_O := $(shell uname -o 2>/dev/null || uname -s)
+ifneq (,$(findstring Msys,$(UNAME_O))$(findstring Cygwin,$(UNAME_O))$(findstring Windows,$(UNAME_O)))
+  QEMU_SHARE = /c/Program Files/QEMU/share
+else ifeq ($(OS),Windows_NT)
+  QEMU_SHARE = /c/Program Files/QEMU/share
+else
+  QEMU_SHARE = /opt/homebrew/share/qemu
+endif
+QEMU_AA64_BIOS = $(QEMU_SHARE)/edk2-aarch64-code.fd
+QEMU_X64_BIOS  = $(QEMU_SHARE)/edk2-x86_64-code.fd
+
 .PHONY: all build run run-gui clean limine image
 
 all: build
@@ -26,7 +38,7 @@ limine:
 	fi
 
 build: limine
-	cargo +nightly build --target $(TARGET_TRIPLE) $(CARGO_FLAGS) -p cyllor-kernel
+	cargo build --target $(TARGET_TRIPLE) $(CARGO_FLAGS) -p cyllor-kernel
 
 image: build
 	bash tools/mkimage.sh $(ARCH) $(KERNEL_ELF)
@@ -37,7 +49,7 @@ ifeq ($(ARCH),aarch64)
 	qemu-system-aarch64 \
 		-M virt,gic-version=3 -cpu cortex-a72 -m 512M -smp 4 \
 		-serial stdio \
-		-bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+		-bios "$(QEMU_AA64_BIOS)" \
 		-drive file=$(IMG),format=raw \
 		-device ramfb \
 		-no-reboot -display none
@@ -45,7 +57,7 @@ else
 	qemu-system-x86_64 \
 		-M q35 -cpu qemu64 -m 512M -smp 4 \
 		-serial stdio \
-		-bios /opt/homebrew/share/qemu/edk2-x86_64-code.fd \
+		-bios "$(QEMU_X64_BIOS)" \
 		-drive file=$(IMG),format=raw \
 		-no-reboot
 endif
@@ -56,7 +68,7 @@ ifeq ($(ARCH),aarch64)
 	qemu-system-aarch64 \
 		-M virt,gic-version=3 -cpu cortex-a72 -m 1G -smp 4 \
 		-serial stdio \
-		-bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+		-bios "$(QEMU_AA64_BIOS)" \
 		-drive file=$(IMG),format=raw \
 		-drive file=target/rootfs.img,format=raw,if=none,id=rootfs \
 		-device virtio-blk-device,drive=rootfs \
@@ -70,7 +82,7 @@ ifeq ($(ARCH),aarch64)
 	qemu-system-aarch64 \
 		-M virt,gic-version=3 -cpu cortex-a72 -m 1G -smp 4 \
 		-serial stdio \
-		-bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+		-bios "$(QEMU_AA64_BIOS)" \
 		-drive file=$(IMG),format=raw \
 		-drive file=target/rootfs.img,format=raw,if=none,id=rootfs \
 		-device virtio-blk-device,drive=rootfs \
@@ -81,7 +93,7 @@ else
 	qemu-system-x86_64 \
 		-M q35 -cpu qemu64 -m 1G -smp 4 \
 		-serial stdio \
-		-bios /opt/homebrew/share/qemu/edk2-x86_64-code.fd \
+		-bios "$(QEMU_X64_BIOS)" \
 		-drive file=$(IMG),format=raw \
 		-device qemu-xhci -device usb-kbd -device usb-mouse \
 		-no-reboot

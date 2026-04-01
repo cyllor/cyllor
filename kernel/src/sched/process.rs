@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::arch::aarch64::paging::AddressSpace;
+use crate::arch::AddressSpace;
 
 pub type Pid = u64;
 
@@ -22,7 +22,7 @@ pub enum ThreadState {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct Context {
-    // Callee-saved registers: x19-x30, sp
+    // Callee-saved registers saved/restored by context_switch assembly.
     pub x19: u64,
     pub x20: u64,
     pub x21: u64,
@@ -34,12 +34,13 @@ pub struct Context {
     pub x27: u64,
     pub x28: u64,
     pub x29: u64, // frame pointer
-    pub x30: u64, // link register (return address)
+    pub x30: u64, // link register (return address / trampoline)
     pub sp: u64,
-    pub elr: u64,   // for userspace: return address
-    pub spsr: u64,  // for userspace: saved PSTATE
-    pub sp_el0: u64, // userspace stack pointer
-    pub ttbr0: u64,  // user page table
+    // User-mode fields (not saved by context_switch; used only for first-run setup).
+    pub elr: u64,    // EL0 entry point
+    pub spsr: u64,   // SPSR_EL1 value for ERET to EL0
+    pub sp_el0: u64, // user stack pointer
+    pub ttbr0: u64,  // user page-table root
 }
 
 impl Context {
@@ -62,6 +63,10 @@ pub struct Thread {
     pub kernel_stack: Vec<u8>,
     pub vruntime: u64,
     pub is_user: bool,
+    /// True until the thread has been context-switched to for the first time.
+    /// The scheduler uses this to load ELR/SPSR/SP_EL0 into x19-x22 for the
+    /// return_to_user_trampoline before clearing the flag.
+    pub first_run: bool,
     pub address_space: Option<AddressSpace>,
 }
 
@@ -84,6 +89,7 @@ impl Thread {
             kernel_stack: stack,
             vruntime: 0,
             is_user: false,
+            first_run: false,
             address_space: None,
         }
     }
@@ -97,6 +103,7 @@ impl Thread {
             kernel_stack: Vec::new(),
             vruntime: u64::MAX,
             is_user: false,
+            first_run: false,
             address_space: None,
         }
     }
@@ -107,12 +114,10 @@ impl Thread {
         let kstack_top = stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
 
         let mut ctx = Context::zero();
-        // x30 = return_to_user trampoline
-        ctx.x30 = return_to_user_trampoline as u64;
+        ctx.x30 = return_to_user_trampoline as *const () as u64;
         ctx.sp = kstack_top;
         ctx.elr = entry;
-        // SPSR: EL0t (return to EL0 with SP_EL0), all interrupts enabled
-        ctx.spsr = 0x0; // EL0t
+        ctx.spsr = 0x0; // SPSR EL0t — interrupts enabled, return to EL0
         ctx.sp_el0 = user_sp;
         ctx.ttbr0 = aspace.root_phys;
 
@@ -124,6 +129,7 @@ impl Thread {
             kernel_stack: stack,
             vruntime: 0,
             is_user: true,
+            first_run: true,
             address_space: Some(aspace),
         }
     }
@@ -138,7 +144,7 @@ pub struct Process {
     pub vmm: alloc::sync::Arc<Mutex<Vmm>>,
 }
 
-/// Minimal VMM stub for /proc/self/maps
+/// Minimal VMM stub for /proc/self/maps.
 pub struct Vmm;
 
 impl Vmm {
@@ -147,83 +153,39 @@ impl Vmm {
     }
 }
 
-/// Return the PID of the currently running process.
-/// (Simplified: always returns 1 until proper scheduler tracking is added.)
+/// Return the PID running on the current CPU.
 pub fn current_pid() -> Pid {
-    1
+    super::cpu::get_current_pid()
 }
 
-/// Global process table — simplified placeholder.
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 pub static PROCESS_TABLE: Mutex<BTreeMap<Pid, Process>> = Mutex::new(BTreeMap::new());
 
-/// Trampoline function: sets up EL0 return and does ERET
-/// Called as a "kernel thread" that immediately drops to user mode
+/// Trampoline: called on a user thread's very first context switch.
+/// Reads entry/spsr/sp_el0/ttbr0 from x19-x22 (loaded by the scheduler)
+/// and ERets to EL0.
 #[unsafe(naked)]
 unsafe extern "C" fn return_to_user_trampoline() -> ! {
-    // At this point:
-    // - Thread's context has elr, spsr, sp_el0, ttbr0 set
-    // - We need to load these and ERET to userspace
-    // The scheduler will have stored context pointer somewhere accessible
-    // For now, we use a simple approach: the context is on the kernel stack
-
     core::arch::naked_asm!(
-        // The thread was "context switched" to, so x19-x30 are restored.
-        // x19 was set to point to the context by the scheduler setup.
-        // But for the trampoline, we stored entry/sp/spsr in the Context struct.
-        // We need a different approach: store user entry info in known registers.
-        //
-        // After context_switch restores x19-x28, x30=this function, sp=kstack.
-        // We stored: x19=elr, x20=spsr, x21=sp_el0, x22=ttbr0
-        // (Set up by the scheduler before first context switch)
-
-        // Set user page table
+        // x19 = ELR (entry point), x20 = SPSR, x21 = SP_EL0, x22 = TTBR0
         "msr TTBR0_EL1, x22",
         "isb",
-
-        // Set up EL0 return
         "msr ELR_EL1, x19",
         "msr SPSR_EL1, x20",
-        // Set SP_EL0 via SPSel trick — msr SP_EL0 traps on QEMU cortex-a72
+        // Switch to SP_EL0 to set user stack, then back to SP_EL1.
         "msr SPSel, #0",
         "mov sp, x21",
         "msr SPSel, #1",
-
-        // Clear all general purpose registers for clean userspace entry
-        "mov x0, #0",
-        "mov x1, #0",
-        "mov x2, #0",
-        "mov x3, #0",
-        "mov x4, #0",
-        "mov x5, #0",
-        "mov x6, #0",
-        "mov x7, #0",
-        "mov x8, #0",
-        "mov x9, #0",
-        "mov x10, #0",
-        "mov x11, #0",
-        "mov x12, #0",
-        "mov x13, #0",
-        "mov x14, #0",
-        "mov x15, #0",
-        "mov x16, #0",
-        "mov x17, #0",
-        "mov x18, #0",
-        // x19-x22 are used above, clear them too
-        "mov x19, #0",
-        "mov x20, #0",
-        "mov x21, #0",
-        "mov x22, #0",
-        "mov x23, #0",
-        "mov x24, #0",
-        "mov x25, #0",
-        "mov x26, #0",
-        "mov x27, #0",
-        "mov x28, #0",
-        "mov x29, #0",
-        "mov x30, #0",
-
+        // Zero all GPRs for a clean userspace entry.
+        "mov x0,  #0", "mov x1,  #0", "mov x2,  #0", "mov x3,  #0",
+        "mov x4,  #0", "mov x5,  #0", "mov x6,  #0", "mov x7,  #0",
+        "mov x8,  #0", "mov x9,  #0", "mov x10, #0", "mov x11, #0",
+        "mov x12, #0", "mov x13, #0", "mov x14, #0", "mov x15, #0",
+        "mov x16, #0", "mov x17, #0", "mov x18, #0", "mov x19, #0",
+        "mov x20, #0", "mov x21, #0", "mov x22, #0", "mov x23, #0",
+        "mov x24, #0", "mov x25, #0", "mov x26, #0", "mov x27, #0",
+        "mov x28, #0", "mov x29, #0", "mov x30, #0",
         "eret",
     );
 }

@@ -40,8 +40,8 @@ global_asm!(
 );
 
 unsafe extern "C" {
-    fn context_switch_asm(old: *mut Context, new: *const Context);
-    fn switch_to_new_asm(new: *const Context);
+    pub fn context_switch_asm(old: *mut Context, new: *const Context);
+    pub fn switch_to_new_asm(new: *const Context);
 }
 
 /// Save `old` callee-saved context and resume `new`.
