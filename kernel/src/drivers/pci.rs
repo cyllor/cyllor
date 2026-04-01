@@ -1,10 +1,8 @@
 // drivers/pci.rs — PCIe ECAM (Enhanced Configuration Access Mechanism) enumeration
 //
-// QEMU virt (AArch64): PCIe ECAM base = 0x4010_0000_0000
+// ECAM base address is provided by crate::arch::PCI_ECAM_BASE (platform-specific).
 // Config space address for (bus, dev, func, reg):
 //   base + (bus << 20) | (dev << 15) | (func << 12) | (reg & 0xFFC)
-//
-// x86_64: ECAM base comes from ACPI MCFG table (not yet implemented).
 
 /// Parsed PCI device descriptor.
 #[derive(Debug, Clone)]
@@ -19,12 +17,8 @@ pub struct PciDevice {
     pub header_type: u8,
 }
 
-#[cfg(target_arch = "aarch64")]
 mod ecam {
     use super::PciDevice;
-
-    /// PCIe ECAM physical base on QEMU virt AArch64.
-    const ECAM_PHYS_BASE: u64 = 0x4010_0000_0000;
 
     const MAX_BUS: u8 = 1;
     const MAX_DEV: u8 = 32;
@@ -40,8 +34,12 @@ mod ecam {
     }
 
     pub fn enumerate() -> alloc::vec::Vec<PciDevice> {
+        let ecam_base = crate::arch::PCI_ECAM_BASE;
+        if ecam_base == 0 {
+            return alloc::vec::Vec::new(); // No ECAM base configured for this arch
+        }
         let mut devices = alloc::vec::Vec::new();
-        let ecam_virt = ECAM_PHYS_BASE + crate::arch::hhdm_offset();
+        let ecam_virt = ecam_base + crate::arch::hhdm_offset();
 
         for bus in 0..MAX_BUS {
             for dev in 0..MAX_DEV {
@@ -74,7 +72,7 @@ mod ecam {
     pub fn init() {
         let devs = enumerate();
         if devs.is_empty() {
-            log::debug!("PCI: no devices found (ECAM base 0x{:x})", ECAM_PHYS_BASE);
+            log::debug!("PCI: no devices found (ECAM base 0x{:x})", crate::arch::PCI_ECAM_BASE);
             return;
         }
         log::info!("PCI: {} device(s) found:", devs.len());
@@ -89,14 +87,10 @@ mod ecam {
 
 /// Enumerate all PCI devices on the bus and return the list.
 pub fn enumerate() -> alloc::vec::Vec<PciDevice> {
-    #[cfg(target_arch = "aarch64")]
-    return ecam::enumerate();
-    #[cfg(not(target_arch = "aarch64"))]
-    return alloc::vec::Vec::new(); // TODO: parse ACPI MCFG on x86_64
+    ecam::enumerate()
 }
 
 /// Enumerate PCI devices and log them.
 pub fn init() {
-    #[cfg(target_arch = "aarch64")]
     ecam::init();
 }

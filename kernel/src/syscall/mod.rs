@@ -8,7 +8,7 @@ mod io;
 
 use crate::arch::TrapFrame;
 
-// Linux syscall numbers for AArch64
+// Linux syscall numbers (AArch64 numbering — must be updated per arch)
 mod nr {
     pub const READ: u64 = 63;
     pub const WRITE: u64 = 64;
@@ -82,11 +82,11 @@ mod nr {
     pub const RSEQ: u64 = 293;
     pub const CLONE3: u64 = 435;
     pub const PRCTL: u64 = 167;
-    pub const ARCH_PRCTL: u64 = 167; // same as PRCTL on aarch64
+    pub const ARCH_PRCTL: u64 = 167;
     pub const UNAME: u64 = 160;
     pub const GETDENTS64: u64 = 61;
     pub const READLINKAT: u64 = 78;
-    pub const ACCESS: u64 = 1039; // faccessat on aarch64
+    pub const ACCESS: u64 = 1039; // faccessat
     pub const FACCESSAT: u64 = 48;
     pub const FACCESSAT2: u64 = 439;
     pub const FSTATFS: u64 = 44;

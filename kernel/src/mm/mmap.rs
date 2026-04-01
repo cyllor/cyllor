@@ -1,5 +1,4 @@
 // User memory management: mmap, munmap, brk
-// Maps physical pages into the user's address space via the merged TTBR0 page table
 
 use crate::syscall::{SyscallResult, ENOMEM, EINVAL};
 use crate::mm::pmm;
@@ -19,9 +18,9 @@ struct UserMemState {
 impl UserMemState {
     const fn new() -> Self {
         Self {
-            brk_base: 0x0000_0060_0000_0000,     // 384 GiB
-            brk_current: 0x0000_0060_0000_0000,
-            mmap_next: 0x0000_0070_0000_0000,     // 448 GiB
+            brk_base: crate::arch::USER_BRK_BASE,
+            brk_current: crate::arch::USER_BRK_BASE,
+            mmap_next: crate::arch::USER_MMAP_BASE,
         }
     }
 }
@@ -74,7 +73,7 @@ pub fn do_mmap(addr: usize, length: usize, prot: u32, flags: u32, fd: i32, offse
         let virt = (map_addr + i * PAGE_SIZE) as u64;
         let phys = pmm::alloc_page().ok_or(ENOMEM)? as u64;
         unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, PAGE_SIZE); }
-        map_page_in_ttbr0(l0_phys, virt, phys, page_flags, hhdm);
+        crate::arch::map_user_page(l0_phys, virt, phys, page_flags);
 
         // For file-backed mappings, copy file data into the page
         if fd >= 0 {
@@ -132,7 +131,7 @@ pub fn do_brk(addr: usize) -> SyscallResult {
         let phys = pmm::alloc_page().unwrap_or(0) as u64;
         if phys == 0 { break; }
         unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, PAGE_SIZE); }
-        map_page_in_ttbr0(l0_phys, page_addr as u64, phys, flags, hhdm);
+        crate::arch::map_user_page(l0_phys, page_addr as u64, phys, flags);
         page_addr += PAGE_SIZE;
     }
 
@@ -140,43 +139,3 @@ pub fn do_brk(addr: usize) -> SyscallResult {
     Ok(state.brk_current)
 }
 
-/// Map a single page in the active 4-level page table (TTBR0)
-pub fn map_page_in_ttbr0(l0_phys: u64, virt: u64, phys: u64, flags: PageFlags, hhdm: u64) {
-    let indices = [
-        ((virt >> 39) & 0x1FF) as usize,
-        ((virt >> 30) & 0x1FF) as usize,
-        ((virt >> 21) & 0x1FF) as usize,
-        ((virt >> 12) & 0x1FF) as usize,
-    ];
-
-    let pte_flags = flags.to_pte();
-    let mut table_phys = l0_phys;
-
-    // Walk/create L0 → L1 → L2
-    for level in 0..3 {
-        let table_virt = (table_phys + hhdm) as *mut u64;
-        let entry = unsafe { core::ptr::read_volatile(table_virt.add(indices[level])) };
-
-        if entry & 1 == 0 {
-            let new_table = pmm::alloc_page().unwrap() as u64;
-            unsafe { core::ptr::write_bytes((new_table + hhdm) as *mut u8, 0, PAGE_SIZE); }
-            let new_entry = new_table | 0x3;
-            unsafe {
-                core::ptr::write_volatile(table_virt.add(indices[level]), new_entry);
-                crate::arch::data_sync_barrier();
-            }
-            table_phys = new_table;
-        } else {
-            table_phys = entry & 0x0000_FFFF_FFFF_F000;
-        }
-    }
-
-    // Write L3 entry
-    let l3_virt = (table_phys + hhdm) as *mut u64;
-    let l3_entry = (phys & 0x0000_FFFF_FFFF_F000) | pte_flags | 0x3 | (1 << 10); // Valid + Page + AF
-    unsafe {
-        core::ptr::write_volatile(l3_virt.add(indices[3]), l3_entry);
-        // Ensure all page table writes are visible
-        crate::arch::data_sync_barrier();
-    }
-}

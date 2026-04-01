@@ -90,11 +90,12 @@ impl VirtioBlock {
     }
 }
 
-/// Probe for VirtIO block devices on QEMU virt machine
-/// QEMU virt puts VirtIO MMIO devices at 0x0a000000 + n*0x200
+/// Probe for VirtIO block devices via MMIO transport.
 pub fn probe(hhdm: u64) {
+    let mmio_base = crate::arch::VIRTIO_MMIO_BASE;
+    if mmio_base == 0 { return; }
     for i in 0..32 {
-        let base = 0x0a000000 + i * 0x200 + hhdm as usize;
+        let base = mmio_base + i * crate::arch::VIRTIO_MMIO_STRIDE + hhdm as usize;
         if let Some(mmio) = VirtioMmio::new(base) {
             let device_id = mmio.device_id();
             if device_id == 0 {

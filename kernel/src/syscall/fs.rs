@@ -9,7 +9,7 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> SyscallResult {
     let mut written = 0usize;
     let mut uaddr = buf;
     while written < count as usize {
-        let pa = match walk_user_page_table(ttbr0, uaddr, hhdm) {
+        let pa = match crate::arch::translate_user_va(ttbr0, uaddr) {
             Some(pa) => pa,
             None => return if written > 0 { Ok(written) } else { Err(super::EFAULT) },
         };
@@ -52,7 +52,7 @@ fn read_user_string(addr: u64, buf: &mut [u8]) -> Result<usize, i32> {
     let mut len = 0;
     let mut uaddr = addr;
     while len < buf.len() - 1 {
-        let pa = match walk_user_page_table(ttbr0, uaddr, hhdm) {
+        let pa = match crate::arch::translate_user_va(ttbr0, uaddr) {
             Some(pa) => pa,
             None => {
                 // Unmapped page — treat as NUL terminator (end of string)
@@ -157,7 +157,7 @@ pub fn copy_to_user(user_addr: u64, data: &[u8]) -> Result<(), i32> {
     let mut offset = 0;
     while offset < data.len() {
         let uaddr = user_addr + offset as u64;
-        match walk_user_page_table(ttbr0, uaddr, hhdm) {
+        match crate::arch::translate_user_va(ttbr0, uaddr) {
             Some(pa) => {
                 let kva = pa + hhdm;
                 let page_rem = 4096 - (uaddr & 0xFFF) as usize;
@@ -176,10 +176,9 @@ pub fn copy_to_user(user_addr: u64, data: &[u8]) -> Result<(), i32> {
                 let page_addr = uaddr & !0xFFF;
                 let phys = crate::mm::pmm::alloc_page().ok_or(super::ENOMEM)? as u64;
                 unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096); }
-                let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
-                crate::mm::mmap::map_page_in_ttbr0(
-                    l0_phys, page_addr, phys,
-                    crate::arch::PageFlags::USER_RW, hhdm,
+                crate::arch::map_user_page(
+                    ttbr0, page_addr, phys,
+                    crate::arch::PageFlags::USER_RW,
                 );
                 // Retry this offset
             }
@@ -196,7 +195,7 @@ pub fn copy_from_user(user_addr: u64, buf: &mut [u8]) -> Result<(), i32> {
     let mut offset = 0;
     while offset < buf.len() {
         let uaddr = user_addr + offset as u64;
-        match walk_user_page_table(ttbr0, uaddr, hhdm) {
+        match crate::arch::translate_user_va(ttbr0, uaddr) {
             Some(pa) => {
                 let kva = pa + hhdm;
                 let page_rem = 4096 - (uaddr & 0xFFF) as usize;
@@ -222,36 +221,6 @@ pub fn print_hex(val: u64) {
         let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
         crate::drivers::uart::write_byte(c);
     }
-}
-
-/// Walk user page table (TTBR0) to translate VA to PA
-pub fn walk_user_page_table(ttbr0: u64, va: u64, hhdm: u64) -> Option<u64> {
-    let indices = [
-        ((va >> 39) & 0x1FF) as usize,
-        ((va >> 30) & 0x1FF) as usize,
-        ((va >> 21) & 0x1FF) as usize,
-        ((va >> 12) & 0x1FF) as usize,
-    ];
-
-    let mut table_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
-
-    for level in 0..3 {
-        let table_virt = (table_phys + hhdm) as *const u64;
-        let entry = unsafe { core::ptr::read_volatile(table_virt.add(indices[level])) };
-        if entry & 1 == 0 {
-            return None;
-        }
-        table_phys = entry & 0x0000_FFFF_FFFF_F000;
-    }
-
-    let l3_virt = (table_phys + hhdm) as *const u64;
-    let entry = unsafe { core::ptr::read_volatile(l3_virt.add(indices[3])) };
-    if entry & 1 == 0 {
-        return None;
-    }
-
-    let page_phys = entry & 0x0000_FFFF_FFFF_F000;
-    Some(page_phys | (va & 0xFFF))
 }
 
 pub fn sys_getdents64(fd: u32, dirp: u64, count: u32) -> SyscallResult {

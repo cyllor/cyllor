@@ -376,7 +376,7 @@ fn handle_page_fault(far: u64, _is_write: bool) -> bool {
     unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096); }
 
     let flags = crate::arch::aarch64::paging::PageFlags::USER_RW;
-    crate::mm::mmap::map_page_in_ttbr0(l0_phys, page_addr, phys, flags, hhdm);
+    crate::arch::aarch64::paging::map_user_page(l0_phys, page_addr, phys, flags);
 
     // Flush TLB for this address
     unsafe {

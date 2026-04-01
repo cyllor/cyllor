@@ -77,7 +77,7 @@ pub fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> SyscallResult {
         let page_virt = virt_addr + (i * 4096) as u64;
         // page_virt is in kernel heap (HHDM mapped), get phys
         let phys = page_virt - hhdm;
-        crate::mm::mmap::map_page_in_ttbr0(l0_phys, (map_addr + i * 4096) as u64, phys, flags, hhdm);
+        crate::arch::map_user_page(l0_phys, (map_addr + i * 4096) as u64, phys, flags);
     }
 
     Ok(map_addr)

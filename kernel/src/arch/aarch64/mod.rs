@@ -150,6 +150,48 @@ impl Arch for Aarch64Arch {
     }
 }
 
+/// Write a byte to the UART (PL011 on QEMU virt).
+/// Uses a constant HHDM offset so it works safely before early_init() completes.
+pub fn uart_write_byte(byte: u8) {
+    const HHDM: u64 = 0xFFFF_0000_0000_0000;
+    let uart_addr = 0x0900_0000u64 + HHDM;
+    unsafe { core::ptr::write_volatile(uart_addr as *mut u8, byte); }
+}
+
+/// Initialize the UART (PL011 on QEMU virt is usable without explicit init).
+pub fn uart_init() {}
+
+// PL011 UART register offsets (QEMU virt)
+const PL011_BASE: u64 = 0x0900_0000;
+const PL011_DR:   usize = 0x000;
+const PL011_FR:   usize = 0x018;
+const PL011_IMSC: usize = 0x038;
+const PL011_ICR:  usize = 0x044;
+
+fn pl011_base() -> u64 { PL011_BASE + hhdm_offset() }
+fn pl011_read(off: usize) -> u32 {
+    unsafe { core::ptr::read_volatile((pl011_base() as usize + off) as *const u32) }
+}
+fn pl011_write(off: usize, val: u32) {
+    unsafe { core::ptr::write_volatile((pl011_base() as usize + off) as *mut u32, val) }
+}
+
+/// Enable UART RX interrupt (PL011: RXIM + RTIM bits in IMSC).
+pub fn uart_enable_rx_interrupt() {
+    pl011_write(PL011_IMSC, (1 << 4) | (1 << 6));
+}
+
+/// Drain PL011 RX FIFO, calling `push_byte` for each received byte.
+pub fn uart_handle_rx_interrupt(push_byte: fn(u8)) {
+    loop {
+        let fr = pl011_read(PL011_FR);
+        if fr & (1 << 4) != 0 { break; } // FIFO empty
+        let byte = (pl011_read(PL011_DR) & 0xFF) as u8;
+        pl011_write(PL011_ICR, (1 << 4) | (1 << 6));
+        push_byte(byte);
+    }
+}
+
 // --------------- SMP bring-up ---------------
 
 /// Per-CPU tick counters (for Phase 1 verification)

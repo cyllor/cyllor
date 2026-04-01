@@ -88,8 +88,10 @@ static NET_DEV: Mutex<Option<VirtioNet>> = Mutex::new(None);
 
 /// Probe all VirtIO MMIO slots for a net device (device ID = 1).
 pub fn probe(hhdm: u64) {
+    let mmio_base = crate::arch::VIRTIO_MMIO_BASE;
+    if mmio_base == 0 { return; }
     for i in 0..32 {
-        let base = 0x0a000000 + i * 0x200 + hhdm as usize;
+        let base = mmio_base + i * crate::arch::VIRTIO_MMIO_STRIDE + hhdm as usize;
         if let Some(mmio) = VirtioMmio::new(base) {
             if mmio.device_id() == 1 {
                 log::info!("VirtIO net device found at 0x{:x}", base - hhdm as usize);

@@ -69,7 +69,7 @@ pub fn spawn_kernel_thread(name: &str, entry: fn()) -> Pid {
 pub fn schedule() {
     let cpu_id = cpu::current_cpu_id();
 
-    let switch_info: Option<(*mut Context, *const Context, bool, Option<u64>)> = {
+    let switch_info: Option<(*mut Context, *const Context, bool, Option<u64>)> = /* (old, new, is_idle, page_table) */ {
         let mut sched = SCHEDULER.lock();
         if !sched.initialized || cpu_id >= sched.num_cpus {
             return;
@@ -138,17 +138,14 @@ pub fn schedule() {
             None => return,
         };
 
-        // First-run setup for user threads: load entry/spsr/sp_el0/ttbr0 into
-        // x19-x22 so return_to_user_trampoline can ERET to EL0.
+        // First-run setup for user threads: prepare arch-specific register
+        // state so the trampoline can transition to user mode.
         if next.is_user && next.first_run {
-            next.context.x19 = next.context.elr;
-            next.context.x20 = next.context.spsr;
-            next.context.x21 = next.context.sp_el0;
-            next.context.x22 = next.context.ttbr0;
+            next.context.prepare_first_run();
             next.first_run = false;
         }
 
-        let ttbr0 = if next.is_user { Some(next.context.ttbr0) } else { None };
+        let user_page_table = if next.is_user { Some(next.context.page_table_root) } else { None };
         let next_pid = next.pid;
         next.state = ThreadState::Running;
 
@@ -157,7 +154,7 @@ pub fn schedule() {
             sched.current[cpu_id] = Some(next);
             cpu::set_current_pid(cpu_id, next_pid);
             let ctx = &sched.current[cpu_id].as_ref().unwrap().context as *const Context;
-            Some((core::ptr::null_mut(), ctx, true, ttbr0))
+            Some((core::ptr::null_mut(), ctx, true, user_page_table))
         } else {
             // Re-queue the previous thread.
             // If it was Running, demote to Ready.  If Blocked, keep Blocked so
@@ -173,14 +170,14 @@ pub fn schedule() {
                 &mut sched.run_queues[cpu_id].back_mut().unwrap().context as *mut Context;
             let new_ctx =
                 &sched.current[cpu_id].as_ref().unwrap().context as *const Context;
-            Some((old_ctx, new_ctx, false, ttbr0))
+            Some((old_ctx, new_ctx, false, user_page_table))
         }
     }; // Scheduler lock released.
 
-    if let Some((old_ctx, new_ctx, is_idle_to_new, ttbr0)) = switch_info {
+    if let Some((old_ctx, new_ctx, is_idle_to_new, page_table)) = switch_info {
         // Switch the user page table outside the lock to avoid TLB broadcast
         // stalling other CPUs' lock acquisitions.
-        if let Some(t) = ttbr0 {
+        if let Some(t) = page_table {
             crate::arch::activate_user_page_table(t);
         }
         if is_idle_to_new {

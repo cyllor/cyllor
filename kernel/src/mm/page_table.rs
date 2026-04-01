@@ -8,11 +8,5 @@ pub use crate::arch::{AddressSpace as PageTable, PageFlags};
 /// Map a single page `phys` → `virt` with the given flags inside `table`.
 #[allow(dead_code)]
 pub fn map_page(table: &PageTable, virt: u64, phys: u64, flags: PageFlags) {
-    crate::mm::mmap::map_page_in_ttbr0(
-        table.root_phys,
-        virt,
-        phys,
-        flags,
-        crate::arch::hhdm_offset(),
-    );
+    crate::arch::map_user_page(table.root_phys, virt, phys, flags);
 }

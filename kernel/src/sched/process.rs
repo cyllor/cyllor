@@ -23,6 +23,8 @@ pub enum ThreadState {
 #[derive(Debug, Clone)]
 pub struct Context {
     // Callee-saved registers saved/restored by context_switch assembly.
+    // Field names match the AArch64 ABI (x19-x30, sp). On x86_64 these
+    // would correspond to rbx, rbp, r12-r15 etc. — redefine per arch.
     pub x19: u64,
     pub x20: u64,
     pub x21: u64,
@@ -37,10 +39,10 @@ pub struct Context {
     pub x30: u64, // link register (return address / trampoline)
     pub sp: u64,
     // User-mode fields (not saved by context_switch; used only for first-run setup).
-    pub elr: u64,    // EL0 entry point
-    pub spsr: u64,   // SPSR_EL1 value for ERET to EL0
-    pub sp_el0: u64, // user stack pointer
-    pub ttbr0: u64,  // user page-table root
+    pub user_pc: u64,           // user entry point (program counter)
+    pub user_flags: u64,        // user processor status flags
+    pub user_sp: u64,           // user stack pointer
+    pub page_table_root: u64,   // user page-table root (physical address)
 }
 
 impl Context {
@@ -48,8 +50,29 @@ impl Context {
         Self {
             x19: 0, x20: 0, x21: 0, x22: 0, x23: 0, x24: 0,
             x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
-            sp: 0, elr: 0, spsr: 0, sp_el0: 0, ttbr0: 0,
+            sp: 0, user_pc: 0, user_flags: 0, user_sp: 0, page_table_root: 0,
         }
+    }
+
+    /// Set the return address for context_switch (link register on AArch64).
+    pub fn set_return_addr(&mut self, addr: u64) {
+        self.x30 = addr;
+    }
+
+    /// Prepare a user-mode thread for its first context switch.
+    /// Loads user-mode fields into callee-saved registers so the arch
+    /// trampoline can perform the privilege transition.
+    #[cfg(target_arch = "aarch64")]
+    pub fn prepare_first_run(&mut self) {
+        self.x19 = self.user_pc;
+        self.x20 = self.user_flags;
+        self.x21 = self.user_sp;
+        self.x22 = self.page_table_root;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn prepare_first_run(&mut self) {
+        // TODO: x86_64 first-run setup
     }
 }
 
@@ -64,8 +87,7 @@ pub struct Thread {
     pub vruntime: u64,
     pub is_user: bool,
     /// True until the thread has been context-switched to for the first time.
-    /// The scheduler uses this to load ELR/SPSR/SP_EL0 into x19-x22 for the
-    /// return_to_user_trampoline before clearing the flag.
+    /// The scheduler calls context.prepare_first_run() before clearing this flag.
     pub first_run: bool,
     pub address_space: Option<AddressSpace>,
 }
@@ -78,7 +100,7 @@ impl Thread {
         let stack_top = stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
 
         let mut ctx = Context::zero();
-        ctx.x30 = entry as u64;
+        ctx.set_return_addr(entry as u64);
         ctx.sp = stack_top;
 
         Thread {
@@ -114,12 +136,12 @@ impl Thread {
         let kstack_top = stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
 
         let mut ctx = Context::zero();
-        ctx.x30 = crate::arch::user_trampoline_addr();
+        ctx.set_return_addr(crate::arch::user_trampoline_addr());
         ctx.sp = kstack_top;
-        ctx.elr = entry;
-        ctx.spsr = 0x0; // SPSR EL0t — interrupts enabled, return to EL0
-        ctx.sp_el0 = user_sp;
-        ctx.ttbr0 = aspace.root_phys;
+        ctx.user_pc = entry;
+        ctx.user_flags = 0x0; // Interrupts enabled, return to user mode
+        ctx.user_sp = user_sp;
+        ctx.page_table_root = aspace.root_phys;
 
         Thread {
             pid,

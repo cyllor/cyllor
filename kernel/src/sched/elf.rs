@@ -1,9 +1,8 @@
-// ELF64 loader for AArch64 Linux binaries
-// Supports both static and dynamically linked (via ld-linux-aarch64.so.1)
+// ELF64 loader for Linux binaries
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use goblin::elf64::header::{Header, EM_AARCH64, ET_DYN};
+use goblin::elf64::header::{Header, ET_DYN};
 use goblin::elf64::program_header::{ProgramHeader, PT_LOAD, PT_INTERP, PT_PHDR, PF_X, PF_W, PF_R};
 use crate::arch::{AddressSpace, PageFlags};
 
@@ -41,7 +40,7 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
     let ehdr = unsafe { &*(data.as_ptr() as *const Header) };
     if ehdr.e_ident[0..4] != ELF_MAGIC { return Err("Bad ELF magic"); }
     if ehdr.e_ident[4] != 2 { return Err("Not ELF64"); }
-    if ehdr.e_machine != EM_AARCH64 as u16 { return Err("Not AArch64"); }
+    if ehdr.e_machine != crate::arch::ELF_MACHINE { return Err("Wrong architecture"); }
 
     let is_pie = ehdr.e_type == ET_DYN as u16;
     let load_bias: u64 = if is_pie { 0x0000_0040_0000 } else { 0 };
@@ -106,7 +105,7 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
 
     // Map user stack (8 MiB)
     let stack_size: usize = 8 * 1024 * 1024;
-    let stack_top: u64 = 0x0000_7FFF_FFFF_0000;
+    let stack_top: u64 = crate::arch::USER_STACK_TOP;
     let stack_bottom = stack_top - stack_size as u64;
     aspace.map_anon(stack_bottom, stack_size, PageFlags::USER_RW)
         .map_err(|_| "Failed to map stack")?;

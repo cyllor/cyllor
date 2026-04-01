@@ -57,7 +57,7 @@ pub fn init() {
 
     // Only use pages that are covered by Limine's HHDM mapping.
     // QEMU virt with -m 1G may have usable memory above 1 GB (UEFI layout),
-    // but Limine's TTBR1 HHDM typically only maps contiguous physical RAM.
+    // but Limine's kernel HHDM typically only maps contiguous physical RAM.
     // We limit to 2 GB to be safe — adjust if needed for larger RAM configs.
     const MAX_PHYS: usize = 2 * 1024 * 1024 * 1024; // 2 GB
 

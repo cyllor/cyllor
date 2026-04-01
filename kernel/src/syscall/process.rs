@@ -56,7 +56,7 @@ pub fn sys_uname(buf: u64) -> SyscallResult {
     write_field(&mut data, 65, b"cyllor");
     write_field(&mut data, 130, b"6.1.0");    // Pretend Linux 6.1
     write_field(&mut data, 195, b"Cyllor OS 0.1");
-    write_field(&mut data, 260, b"aarch64");
+    write_field(&mut data, 260, crate::arch::ARCH_NAME.as_bytes());
     super::fs::copy_to_user(buf, &data).map_err(|_| super::EFAULT)?;
     Ok(0)
 }

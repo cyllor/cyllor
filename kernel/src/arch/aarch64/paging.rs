@@ -408,6 +408,19 @@ pub fn fix_device_mmio_attrs() {
     }
 }
 
+/// Translate a user virtual address using an arbitrary page table root (physical address).
+pub fn translate_user_va(root_phys: u64, va: u64) -> Option<u64> {
+    let aspace = core::mem::ManuallyDrop::new(AddressSpace { root_phys });
+    aspace.translate(va)
+}
+
+/// Map a single user page (phys → virt) in the page table rooted at root_phys.
+pub fn map_user_page(root_phys: u64, virt: u64, phys: u64, flags: PageFlags) {
+    let aspace = core::mem::ManuallyDrop::new(AddressSpace { root_phys });
+    let _ = aspace.map_page(virt, phys, flags);
+    super::data_sync_barrier();
+}
+
 /// Map a physical device MMIO range into TTBR1 (kernel HHDM space).
 /// Limine's HHDM may not include device MMIO regions — this ensures
 /// GIC, UART etc. are accessible from all CPUs via TTBR1.

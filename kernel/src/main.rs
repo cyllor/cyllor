@@ -39,9 +39,9 @@ unsafe extern "C" fn _start() -> ! {
     let num_cpus = arch::cpu_count();
     sched::init(num_cpus);
 
-    // NOTE: Don't clear TTBR0 during boot — Limine's boot stack is
-    // identity-mapped via TTBR0. TLB flush happens in the trampoline after
-    // switch_to_new moves us to the user thread's HHDM kernel stack.
+    // NOTE: Don't clear the user page table during boot — Limine's boot stack
+    // is identity-mapped via the user-space page table. TLB flush happens in
+    // the trampoline after switch_to_new moves us to the kernel stack.
 
     arch::start_secondary_cpus();
 
@@ -122,8 +122,8 @@ unsafe extern "C" fn _start() -> ! {
 
 fn run_first_user_process() {
     // All user mappings (ELF, interpreter, stack) are already in aspace.root_phys.
-    // No TTBR0 merge with Limine is needed — user code only accesses user VA space,
-    // and kernel syscalls use TTBR1 for kernel VA.
+    // No merge with Limine's page table is needed — user code only accesses user VA
+    // space, and kernel syscalls use kernel-space page tables for kernel VA.
 
     let has_user = {
         let sched = sched::SCHEDULER.lock();
@@ -138,17 +138,20 @@ fn run_first_user_process() {
     log::info!("Starting first user process via scheduler");
 
     // Mask IRQs to prevent re-entrant SCHEDULER lock deadlock.
-    // After ERET to EL0, SPSR_EL1=0 restores PSTATE with IRQs enabled.
+    // After return to user mode, IRQs are re-enabled by the arch trampoline.
     arch::mask_irqs();
 
     crate::sched::scheduler::schedule();
 
-    // Never reached — schedule() → switch_to_new → trampoline → eret to EL0
+    // Never reached — schedule() → switch_to_new → trampoline → return to user mode
     loop { arch::PlatformArch::halt(); }
 }
 
-/// Minimal static AArch64 ELF that does write(1, "Hello from userspace!\n", 22) then exit(0)
+/// Create a minimal test ELF binary with arch-specific machine code.
+/// Currently only implemented for AArch64 (ARM instructions).
+#[cfg(target_arch = "aarch64")]
 fn create_test_elf() {
+    // AArch64 machine code: write(1, "Hello from userspace!\n", 22) then exit(0)
     let code: &[u8] = &[
         0x20, 0x00, 0x80, 0xd2, // mov x0, #1
         0xe1, 0x00, 0x00, 0x10, // adr x1, .+28 (msg at 0x4000a0)
@@ -170,7 +173,7 @@ fn create_test_elf() {
     elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
     elf[4] = 2; elf[5] = 1; elf[6] = 1;
     elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
-    elf[18..20].copy_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+    elf[18..20].copy_from_slice(&arch::ELF_MACHINE.to_le_bytes());
     elf[20..24].copy_from_slice(&1u32.to_le_bytes());
     elf[24..32].copy_from_slice(&entry_vaddr.to_le_bytes());
     elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
@@ -206,24 +209,33 @@ fn create_test_elf() {
     log::info!("Test ELF /bin/hello created");
 }
 
+#[cfg(not(target_arch = "aarch64"))]
+fn create_test_elf() {
+    log::warn!("Test ELF not available for {} (no embedded machine code)", arch::ARCH_NAME);
+}
+
 /// Load specific files from ext4 rootfs into the in-memory VFS on demand
 fn load_rootfs_to_vfs() {
-    // Only load specific binaries needed for init, not everything
-    let critical_files = [
-        // Dynamic linker (try both usrmerge and classic paths)
-        "/lib/ld-linux-aarch64.so.1",
-        "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
-        // glibc core
-        "/lib/aarch64-linux-gnu/libc.so.6",
-        "/usr/lib/aarch64-linux-gnu/libc.so.6",
-        "/lib/aarch64-linux-gnu/libm.so.6",
-        "/lib/aarch64-linux-gnu/libdl.so.2",
-        "/usr/lib/aarch64-linux-gnu/libdl.so.2",
-        "/lib/aarch64-linux-gnu/libpthread.so.0",
-        "/lib/aarch64-linux-gnu/libgcc_s.so.1",
-        "/lib/aarch64-linux-gnu/libtinfo.so.6",
-        "/lib/aarch64-linux-gnu/libreadline.so.8",
-        // Binaries
+    let interp = arch::INTERP_NAME;
+    let gnu_dir = arch::GNU_LIB_DIR;
+
+    // Build arch-dependent paths at runtime using arch constants.
+    let arch_paths: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+        alloc::format!("/lib/{}", interp),
+        alloc::format!("/usr/lib/{}/{}", gnu_dir, interp),
+        alloc::format!("/lib/{}/libc.so.6", gnu_dir),
+        alloc::format!("/usr/lib/{}/libc.so.6", gnu_dir),
+        alloc::format!("/lib/{}/libm.so.6", gnu_dir),
+        alloc::format!("/lib/{}/libdl.so.2", gnu_dir),
+        alloc::format!("/usr/lib/{}/libdl.so.2", gnu_dir),
+        alloc::format!("/lib/{}/libpthread.so.0", gnu_dir),
+        alloc::format!("/lib/{}/libgcc_s.so.1", gnu_dir),
+        alloc::format!("/lib/{}/libtinfo.so.6", gnu_dir),
+        alloc::format!("/lib/{}/libreadline.so.8", gnu_dir),
+    ];
+
+    // Architecture-independent binary paths.
+    let static_paths: &[&str] = &[
         "/sbin/init", "/usr/sbin/init",
         "/bin/bash", "/usr/bin/bash",
         "/bin/sh", "/usr/bin/sh",
@@ -233,7 +245,10 @@ fn load_rootfs_to_vfs() {
         "/usr/bin/xfce4-session",
     ];
 
-    for path in &critical_files {
+    let all_paths = arch_paths.iter().map(|s| s.as_str())
+        .chain(static_paths.iter().copied());
+
+    for path in all_paths {
         // Ensure parent directories exist
         if let Some(parent_path) = path.rsplit_once('/') {
             let dir = parent_path.0;
@@ -260,8 +275,8 @@ fn load_rootfs_to_vfs() {
             Err(_) => {}
         }
 
-        // For ld-linux, also create a copy at /lib/ld-linux-aarch64.so.1
-        if path.contains("ld-linux") {
+        // For the dynamic linker, also ensure a canonical copy exists at /lib/<interp>
+        if path.contains(interp) {
             if let Ok(data) = fs::ext4::read_file(path) {
                 let size = data.len();
                 if let Ok(lib_node) = fs::vfs::resolve_path("/lib") {
@@ -270,10 +285,10 @@ fn load_rootfs_to_vfs() {
                     inode.data = data;
                     inode.size = size;
                     ln.children.insert(
-                        alloc::string::ToString::to_string("ld-linux-aarch64.so.1"),
+                        alloc::string::ToString::to_string(interp),
                         alloc::sync::Arc::new(spin::Mutex::new(inode)),
                     );
-                    log::debug!("Linked /lib/ld-linux-aarch64.so.1 ({} KiB)", size / 1024);
+                    log::debug!("Linked /lib/{} ({} KiB)", interp, size / 1024);
                 }
             }
         }
