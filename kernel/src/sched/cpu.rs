@@ -10,16 +10,9 @@ static CURRENT_PID: [AtomicU64; MAX_CPUS] = {
     [ZERO; MAX_CPUS]
 };
 
-/// Return the logical CPU ID from MPIDR.Aff0.
+/// Return the logical CPU ID of the current CPU.
 pub fn current_cpu_id() -> usize {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let mpidr: u64;
-        unsafe { core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr) };
-        (mpidr & 0xFF) as usize
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    { 0 }
+    crate::arch::current_cpu_id()
 }
 
 /// Store the PID of the thread now running on `cpu`.

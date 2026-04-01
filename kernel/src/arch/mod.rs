@@ -33,3 +33,15 @@ pub fn ticks() -> u64 { aarch64::exceptions::ticks() }
 pub fn hhdm_offset() -> u64 { aarch64::hhdm_offset() }
 #[cfg(target_arch = "aarch64")]
 pub use self::aarch64::paging::{AddressSpace, PageFlags};
+#[cfg(target_arch = "aarch64")]
+pub fn current_cpu_id() -> usize { aarch64::current_cpu_id() }
+#[cfg(not(target_arch = "aarch64"))]
+pub fn current_cpu_id() -> usize { 0 }
+#[cfg(target_arch = "aarch64")]
+pub fn read_counter() -> u64 { aarch64::read_counter() }
+#[cfg(not(target_arch = "aarch64"))]
+pub fn read_counter() -> u64 { 0 }
+#[cfg(target_arch = "aarch64")]
+pub fn activate_user_page_table(root_phys: u64) { aarch64::activate_user_page_table(root_phys) }
+#[cfg(not(target_arch = "aarch64"))]
+pub fn activate_user_page_table(_root_phys: u64) {}

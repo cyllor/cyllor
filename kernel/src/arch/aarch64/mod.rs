@@ -60,6 +60,25 @@ pub fn cpu_count() -> usize {
         .unwrap_or(1)
 }
 
+/// Return the logical CPU ID from MPIDR_EL1.Aff0.
+pub fn current_cpu_id() -> usize {
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr) };
+    (mpidr & 0xFF) as usize
+}
+
+/// Read the AArch64 virtual counter (CNTVCT_EL0).
+pub fn read_counter() -> u64 {
+    let val: u64;
+    unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) val) };
+    val
+}
+
+/// Switch the user-mode page table (TTBR0_EL1) without a full TLB flush.
+pub fn activate_user_page_table(root_phys: u64) {
+    unsafe { core::arch::asm!("msr TTBR0_EL1, {0}", "isb", in(reg) root_phys) };
+}
+
 impl Arch for Aarch64Arch {
     fn init_interrupts() {
         exceptions::init();

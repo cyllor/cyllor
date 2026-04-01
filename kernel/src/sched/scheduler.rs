@@ -181,9 +181,7 @@ pub fn schedule() {
         // Switch the user page table outside the lock to avoid TLB broadcast
         // stalling other CPUs' lock acquisitions.
         if let Some(t) = ttbr0 {
-            unsafe {
-                core::arch::asm!("msr TTBR0_EL1, {0}", "isb", in(reg) t);
-            }
+            crate::arch::activate_user_page_table(t);
         }
         if is_idle_to_new {
             unsafe { crate::arch::aarch64::context::switch_to_new_asm(new_ctx); }

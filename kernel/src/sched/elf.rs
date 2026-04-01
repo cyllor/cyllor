@@ -196,8 +196,7 @@ pub fn setup_user_stack(
     sp -= 16;
     let random_addr = sp;
     let mut random_data = [0u8; 16];
-    let mut seed: u64 = 0;
-    unsafe { core::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) seed) };
+    let mut seed: u64 = crate::arch::read_counter();
     for b in random_data.iter_mut() {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         *b = (seed >> 33) as u8;
