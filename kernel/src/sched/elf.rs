@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use goblin::elf64::header::{Header, ET_DYN};
 use goblin::elf64::program_header::{ProgramHeader, PT_LOAD, PT_INTERP, PT_PHDR, PF_X, PF_W, PF_R};
-use crate::arch::{AddressSpace, PageFlags};
+use crate::arch::{PageAttr, PageTable};
 
 const PAGE_SIZE: usize = 4096;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -18,7 +18,9 @@ const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
 const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
 const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
 const AT_RANDOM: u64 = 25;
 
 pub struct ElfLoadResult {
@@ -33,7 +35,7 @@ pub struct ElfLoadResult {
 }
 
 /// Load an ELF binary into the given address space
-pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'static str> {
+pub fn load_elf(data: &[u8], aspace: &dyn PageTable) -> Result<ElfLoadResult, &'static str> {
     if data.len() < core::mem::size_of::<Header>() {
         return Err("ELF too small");
     }
@@ -107,7 +109,7 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
     let stack_size: usize = 8 * 1024 * 1024;
     let stack_top: u64 = crate::arch::USER_STACK_TOP;
     let stack_bottom = stack_top - stack_size as u64;
-    aspace.map_anon(stack_bottom, stack_size, PageFlags::USER_RW)
+    aspace.map_anon(stack_bottom, stack_size, PageAttr::USER_RW)
         .map_err(|_| "Failed to map stack")?;
 
     // Load interpreter if needed
@@ -125,7 +127,7 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
                     interp_base = ld_base;
                     final_entry = ld_entry;
                     let h = crate::arch::hhdm_offset();
-                    let l0p = (aspace.root_phys + h) as *const u64;
+                    let l0p = (aspace.root_phys() + h) as *const u64;
                     let l0a = unsafe { core::ptr::read_volatile(l0p.add(0xA)) };
                     log::info!("VFS interp: L0[0xA]=0x{:x} entry=0x{:x}", l0a, ld_entry);
                 }
@@ -138,7 +140,7 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
                         interp_base = ld_base;
                         final_entry = ld_entry;
                         let hhdm_off = crate::arch::hhdm_offset();
-                        let l0 = (aspace.root_phys + hhdm_off) as *const u64;
+                        let l0 = (aspace.root_phys() + hhdm_off) as *const u64;
                         let l0_a = unsafe { core::ptr::read_volatile(l0.add(0xA)) };
                         log::info!("After load_interp: L0[0xA] = 0x{:x}", l0_a);
                         log::info!("Loaded interpreter at 0x{:x}, entry=0x{:x}", ld_base, ld_entry);
@@ -169,7 +171,7 @@ pub fn load_elf(data: &[u8], aspace: &AddressSpace) -> Result<ElfLoadResult, &'s
 /// Build the initial user stack with argv, envp, and auxval.
 /// Returns the new stack pointer.
 pub fn setup_user_stack(
-    aspace: &AddressSpace,
+    aspace: &dyn PageTable,
     stack_top: u64,
     argv: &[&[u8]],
     envp: &[&[u8]],
@@ -177,13 +179,13 @@ pub fn setup_user_stack(
 ) -> Result<u64, &'static str> {
     let mut sp = stack_top;
 
-    let push_bytes = |sp: &mut u64, data: &[u8], aspace: &AddressSpace| -> Result<u64, &'static str> {
+    let push_bytes = |sp: &mut u64, data: &[u8], aspace: &dyn PageTable| -> Result<u64, &'static str> {
         *sp -= data.len() as u64;
         aspace.copy_to_user(*sp, data).map_err(|_| "stack write failed")?;
         Ok(*sp)
     };
 
-    let push_u64 = |sp: &mut u64, val: u64, aspace: &AddressSpace| -> Result<(), &'static str> {
+    let push_u64 = |sp: &mut u64, val: u64, aspace: &dyn PageTable| -> Result<(), &'static str> {
         *sp -= 8;
         aspace.copy_to_user(*sp, &val.to_le_bytes()).map_err(|_| "stack write failed")?;
         Ok(())
@@ -226,10 +228,11 @@ pub fn setup_user_stack(
 
     sp &= !0xF;
 
-    let total_items = 1 + arg_ptrs.len() + 1 + env_ptrs.len() + 1 + 2 * 10 + 2;
+    let total_items = 1 + arg_ptrs.len() + 1 + env_ptrs.len() + 1 + 2 * 12 + 2;
     if total_items % 2 != 0 { sp -= 8; }
 
     // Auxiliary vector
+    let (uid, gid, euid, egid) = crate::syscall::current_creds();
     push_u64(&mut sp, 0, aspace)?; push_u64(&mut sp, AT_NULL, aspace)?;
     push_u64(&mut sp, random_addr, aspace)?; push_u64(&mut sp, AT_RANDOM, aspace)?;
     push_u64(&mut sp, PAGE_SIZE as u64, aspace)?; push_u64(&mut sp, AT_PAGESZ, aspace)?;
@@ -238,8 +241,10 @@ pub fn setup_user_stack(
     push_u64(&mut sp, elf_result.phnum as u64, aspace)?; push_u64(&mut sp, AT_PHNUM, aspace)?;
     push_u64(&mut sp, elf_result.exe_entry, aspace)?; push_u64(&mut sp, AT_ENTRY, aspace)?;
     push_u64(&mut sp, elf_result.interp_base, aspace)?; push_u64(&mut sp, AT_BASE, aspace)?;
-    push_u64(&mut sp, 0, aspace)?; push_u64(&mut sp, AT_UID, aspace)?;
-    push_u64(&mut sp, 0, aspace)?; push_u64(&mut sp, AT_GID, aspace)?;
+    push_u64(&mut sp, uid as u64, aspace)?; push_u64(&mut sp, AT_UID, aspace)?;
+    push_u64(&mut sp, euid as u64, aspace)?; push_u64(&mut sp, AT_EUID, aspace)?;
+    push_u64(&mut sp, gid as u64, aspace)?; push_u64(&mut sp, AT_GID, aspace)?;
+    push_u64(&mut sp, egid as u64, aspace)?; push_u64(&mut sp, AT_EGID, aspace)?;
 
     push_u64(&mut sp, 0, aspace)?;
     for ptr in env_ptrs.iter().rev() { push_u64(&mut sp, *ptr, aspace)?; }
@@ -254,7 +259,7 @@ pub fn setup_user_stack(
 
 /// Load an ELF interpreter (ld-linux) at a given base address.
 /// Returns the interpreter entry point.
-fn load_interp(data: &[u8], aspace: &AddressSpace, base: u64) -> Result<u64, &'static str> {
+fn load_interp(data: &[u8], aspace: &dyn PageTable, base: u64) -> Result<u64, &'static str> {
     if data.len() < core::mem::size_of::<Header>() {
         return Err("Interpreter ELF too small");
     }
@@ -299,8 +304,8 @@ fn load_interp(data: &[u8], aspace: &AddressSpace, base: u64) -> Result<u64, &'s
     Ok(ehdr.e_entry + load_bias)
 }
 
-fn phdr_to_pageflags(p_flags: u32) -> PageFlags {
-    PageFlags {
+fn phdr_to_pageflags(p_flags: u32) -> PageAttr {
+    PageAttr {
         readable: p_flags & PF_R != 0,
         writable: p_flags & PF_W != 0,
         executable: p_flags & PF_X != 0,

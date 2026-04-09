@@ -63,6 +63,7 @@ impl Vma {
 }
 
 /// Per-process VMA map.  Keys are VMA start addresses for O(log n) lookup.
+#[derive(Clone)]
 pub struct Vmm {
     vmas: BTreeMap<u64, Vma>,
 }
@@ -133,6 +134,11 @@ impl Vmm {
 
     /// Return the number of mapped VMAs.
     pub fn len(&self) -> usize { self.vmas.len() }
+
+    /// Return a stable snapshot of all VMAs ordered by start address.
+    pub fn snapshot(&self) -> Vec<Vma> {
+        self.vmas.values().cloned().collect()
+    }
 
     /// Render /proc/self/maps content.
     pub fn maps_string(&self) -> String {

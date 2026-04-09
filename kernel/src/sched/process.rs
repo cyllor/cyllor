@@ -1,7 +1,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
+use alloc::boxed::Box;
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::arch::AddressSpace;
+use crate::arch::PageTable;
+use crate::mm::vmm::Vmm;
 
 pub type Pid = u64;
 
@@ -43,6 +45,7 @@ pub struct Context {
     pub user_flags: u64,        // user processor status flags
     pub user_sp: u64,           // user stack pointer
     pub page_table_root: u64,   // user page-table root (physical address)
+    pub user_tls: u64,          // TPIDR_EL0 value for user thread-local storage
 }
 
 impl Context {
@@ -50,7 +53,7 @@ impl Context {
         Self {
             x19: 0, x20: 0, x21: 0, x22: 0, x23: 0, x24: 0,
             x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
-            sp: 0, user_pc: 0, user_flags: 0, user_sp: 0, page_table_root: 0,
+            sp: 0, user_pc: 0, user_flags: 0, user_sp: 0, page_table_root: 0, user_tls: 0,
         }
     }
 
@@ -68,6 +71,7 @@ impl Context {
         self.x20 = self.user_flags;
         self.x21 = self.user_sp;
         self.x22 = self.page_table_root;
+        self.x23 = self.user_tls;
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -89,7 +93,7 @@ pub struct Thread {
     /// True until the thread has been context-switched to for the first time.
     /// The scheduler calls context.prepare_first_run() before clearing this flag.
     pub first_run: bool,
-    pub address_space: Option<AddressSpace>,
+    pub address_space: Option<Box<dyn PageTable + Send + Sync>>,
 }
 
 impl Thread {
@@ -130,7 +134,7 @@ impl Thread {
         }
     }
 
-    pub fn new_user(name: &str, pid: Pid, entry: u64, user_sp: u64, aspace: AddressSpace) -> Self {
+    pub fn new_user(name: &str, pid: Pid, entry: u64, user_sp: u64, aspace: Box<dyn PageTable + Send + Sync>) -> Self {
         let mut stack = Vec::with_capacity(KERNEL_STACK_SIZE);
         stack.resize(KERNEL_STACK_SIZE, 0u8);
         let kstack_top = stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
@@ -141,7 +145,8 @@ impl Thread {
         ctx.user_pc = entry;
         ctx.user_flags = 0x0; // Interrupts enabled, return to user mode
         ctx.user_sp = user_sp;
-        ctx.page_table_root = aspace.root_phys;
+        ctx.page_table_root = aspace.root_phys();
+        ctx.user_tls = 0;
 
         Thread {
             pid,
@@ -155,24 +160,67 @@ impl Thread {
             address_space: Some(aspace),
         }
     }
+
+    /// Create a user thread that reuses an existing user page-table root.
+    /// Used by clone() style thread/process creation before we can safely
+    /// duplicate the full address-space object.
+    pub fn new_user_cloned(
+        name: &str,
+        pid: Pid,
+        user_pc: u64,
+        user_sp: u64,
+        page_table_root: u64,
+        user_tls: u64,
+    ) -> Self {
+        let mut stack = Vec::with_capacity(KERNEL_STACK_SIZE);
+        stack.resize(KERNEL_STACK_SIZE, 0u8);
+        let kstack_top = stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
+
+        let mut ctx = Context::zero();
+        ctx.set_return_addr(crate::arch::user_trampoline_addr());
+        ctx.sp = kstack_top;
+        ctx.user_pc = user_pc;
+        ctx.user_flags = 0x0;
+        ctx.user_sp = user_sp;
+        ctx.page_table_root = page_table_root;
+        ctx.user_tls = user_tls;
+
+        Thread {
+            pid,
+            name: String::from(name),
+            state: ThreadState::Ready,
+            context: ctx,
+            kernel_stack: stack,
+            vruntime: 0,
+            is_user: true,
+            first_run: true,
+            // Clone currently shares root_phys only; full aspace object sharing
+            // will be introduced with ref-counted address-space handles.
+            address_space: None,
+        }
+    }
 }
 
 pub struct Process {
     pub pid: Pid,
     pub tgid: Pid,
+    pub pgid: Pid,
+    pub sid: Pid,
     pub ppid: Pid,
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+    pub suid: u32,
+    pub sgid: u32,
+    pub no_new_privs: bool,
     pub name: String,
+    pub environ: Vec<u8>,
     pub threads: Vec<Pid>,
+    pub brk_base: usize,
+    pub brk_current: usize,
+    pub mmap_next: usize,
     pub vmm: alloc::sync::Arc<Mutex<Vmm>>,
-}
-
-/// Minimal VMM stub for /proc/self/maps.
-pub struct Vmm;
-
-impl Vmm {
-    pub fn maps_string(&self) -> String {
-        String::new()
-    }
 }
 
 /// Return the PID running on the current CPU.

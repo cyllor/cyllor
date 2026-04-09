@@ -1,4 +1,4 @@
-use crate::arch::Arch;
+use crate::arch::{Arch, CpuContext, PageAttr, PageTable};
 
 pub struct X86Arch;
 
@@ -38,7 +38,37 @@ pub fn uart_init() {
 // --------------- Stub types for x86_64 (unimplemented) ---------------
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct TrapFrame;
+pub struct TrapFrame {
+    pub regs: [u64; 32],
+    pub rip: u64,
+    pub rsp: u64,
+}
+
+impl CpuContext for TrapFrame {
+    #[inline]
+    fn reg(&self, idx: usize) -> u64 {
+        self.regs.get(idx).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn set_reg(&mut self, idx: usize, val: u64) {
+        if let Some(slot) = self.regs.get_mut(idx) {
+            *slot = val;
+        }
+    }
+
+    #[inline]
+    fn pc(&self) -> u64 { self.rip }
+
+    #[inline]
+    fn set_pc(&mut self, val: u64) { self.rip = val; }
+
+    #[inline]
+    fn sp(&self) -> u64 { self.rsp }
+
+    #[inline]
+    fn set_sp(&mut self, val: u64) { self.rsp = val; }
+}
 
 /// Stub address space — no page table operations implemented on x86_64 yet.
 pub struct AddressSpace {
@@ -47,31 +77,25 @@ pub struct AddressSpace {
 
 impl AddressSpace {
     pub fn new() -> Option<Self> { None }
-    pub fn map_page(&self, _virt: u64, _phys: u64, _flags: PageFlags) -> Result<(), ()> { Ok(()) }
-    pub fn map_anon(&self, _virt: u64, _size: usize, _flags: PageFlags) -> Result<(), ()> { Ok(()) }
+    pub fn map_page(&self, _virt: u64, _phys: u64, _flags: PageAttr) -> Result<(), ()> { Ok(()) }
+    pub fn map_anon(&self, _virt: u64, _size: usize, _flags: PageAttr) -> Result<(), ()> { Ok(()) }
     pub fn translate(&self, _virt: u64) -> Option<u64> { None }
     pub fn copy_to_user(&self, _user_virt: u64, _data: &[u8]) -> Result<(), ()> { Ok(()) }
     pub fn copy_from_user(&self, _user_virt: u64, _buf: &mut [u8]) -> Result<(), ()> { Ok(()) }
     pub fn activate(&self) {}
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct PageFlags {
-    pub readable: bool,
-    pub writable: bool,
-    pub executable: bool,
-    pub user: bool,
-    pub device: bool,
-}
-
-impl PageFlags {
-    pub const USER_RWX: Self = Self { readable: true, writable: true, executable: true, user: true, device: false };
-    pub const USER_RW:  Self = Self { readable: true, writable: true, executable: false, user: true, device: false };
-    pub const USER_RX:  Self = Self { readable: true, writable: false, executable: true, user: true, device: false };
-    pub const USER_RO:  Self = Self { readable: true, writable: false, executable: false, user: true, device: false };
-    pub const KERNEL_RW:  Self = Self { readable: true, writable: true, executable: false, user: false, device: false };
-    pub const KERNEL_RWX: Self = Self { readable: true, writable: true, executable: true, user: false, device: false };
-    pub const DEVICE: Self = Self { readable: true, writable: true, executable: false, user: false, device: true };
+impl PageTable for AddressSpace {
+    fn root_phys(&self) -> u64 { self.root_phys }
+    fn map_anon(&self, virt_start: u64, size: usize, flags: PageAttr) -> Result<(), ()> {
+        AddressSpace::map_anon(self, virt_start, size, flags)
+    }
+    fn copy_to_user(&self, virt: u64, data: &[u8]) -> Result<(), ()> {
+        AddressSpace::copy_to_user(self, virt, data)
+    }
+    fn copy_from_user(&self, virt: u64, buf: &mut [u8]) -> Result<(), ()> {
+        AddressSpace::copy_from_user(self, virt, buf)
+    }
 }
 
 static HHDM_OFFSET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

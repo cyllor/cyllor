@@ -27,7 +27,7 @@ endif
 QEMU_AA64_BIOS = $(QEMU_SHARE)/edk2-aarch64-code.fd
 QEMU_X64_BIOS  = $(QEMU_SHARE)/edk2-x86_64-code.fd
 
-.PHONY: all build run run-gui clean limine image
+.PHONY: all build run run-gui clean limine image check check-decouple
 
 all: build
 
@@ -102,3 +102,15 @@ endif
 clean:
 	cargo clean
 	rm -rf target/*.img target/iso_root
+
+check: check-decouple
+
+check-decouple:
+	@if command -v pwsh >/dev/null 2>&1; then \
+		pwsh -NoProfile -File tools/check_arch_leak.ps1; \
+	elif command -v powershell >/dev/null 2>&1; then \
+		powershell -ExecutionPolicy Bypass -File tools/check_arch_leak.ps1; \
+	else \
+		echo "PowerShell not found (need pwsh or powershell)"; \
+		exit 1; \
+	fi

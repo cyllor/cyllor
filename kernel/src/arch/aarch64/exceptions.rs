@@ -1,6 +1,7 @@
 use core::arch::global_asm;
 use super::gic;
 use super::timer;
+use crate::arch::CpuContext;
 
 /// Trap frame saved on exception entry
 #[repr(C)]
@@ -9,6 +10,32 @@ pub struct TrapFrame {
     pub sp: u64,
     pub elr: u64,        // Exception Link Register
     pub spsr: u64,       // Saved Program Status Register
+}
+
+impl CpuContext for TrapFrame {
+    #[inline]
+    fn reg(&self, idx: usize) -> u64 {
+        debug_assert!(idx < self.regs.len());
+        self.regs[idx]
+    }
+
+    #[inline]
+    fn set_reg(&mut self, idx: usize, val: u64) {
+        debug_assert!(idx < self.regs.len());
+        self.regs[idx] = val;
+    }
+
+    #[inline]
+    fn pc(&self) -> u64 { self.elr }
+
+    #[inline]
+    fn set_pc(&mut self, val: u64) { self.elr = val; }
+
+    #[inline]
+    fn sp(&self) -> u64 { self.sp }
+
+    #[inline]
+    fn set_sp(&mut self, val: u64) { self.sp = val; }
 }
 
 // Exception vector table
@@ -375,7 +402,7 @@ fn handle_page_fault(far: u64, _is_write: bool) -> bool {
     };
     unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096); }
 
-    let flags = crate::arch::aarch64::paging::PageFlags::USER_RW;
+    let flags = crate::arch::PageAttr::USER_RW;
     crate::arch::aarch64::paging::map_user_page(l0_phys, page_addr, phys, flags);
 
     // Flush TLB for this address

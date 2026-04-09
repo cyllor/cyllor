@@ -358,7 +358,7 @@ pub fn handle_ioctl_with_minor(minor: u32, request: u64, arg: u64) -> crate::sys
             }
             Ok(0)
         }
-        _ => Ok(0),
+        _ => Err(crate::syscall::ENOTTY),
     }
 }
 

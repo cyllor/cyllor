@@ -1,6 +1,8 @@
 pub mod pmm;
 mod heap;
 pub mod mmap;
+pub mod shm;
+pub mod vmm;
 
 use linked_list_allocator::LockedHeap;
 
@@ -65,4 +67,5 @@ fn find_contiguous_region(size: usize) -> Option<usize> {
 }
 
 pub use pmm::{alloc_page, free_page};
-pub use mmap::{do_mmap, do_munmap, do_brk};
+pub use mmap::{do_brk, do_mmap, do_mprotect, do_munmap};
+pub use shm::{do_shmat, do_shmctl, do_shmdt, do_shmget};

@@ -90,7 +90,14 @@ unsafe extern "C" fn _start() -> ! {
     }
 
     // Spawn init process
-    let init_paths = ["/bin/bash", "/bin/hello_raw", "/bin/hello"];
+    let init_paths = [
+        "/usr/bin/startxfce4",
+        "/usr/bin/xfce4-session",
+        "/usr/bin/weston",
+        "/bin/bash",
+        "/bin/hello_raw",
+        "/bin/hello",
+    ];
     for path in &init_paths {
         match sched::spawn_user_process(path, &[path.as_bytes()], &[
             b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",

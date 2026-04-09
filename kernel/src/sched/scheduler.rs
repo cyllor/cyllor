@@ -156,18 +156,22 @@ pub fn schedule() {
             let ctx = &sched.current[cpu_id].as_ref().unwrap().context as *const Context;
             Some((core::ptr::null_mut(), ctx, true, user_page_table))
         } else {
-            // Re-queue the previous thread.
-            // If it was Running, demote to Ready.  If Blocked, keep Blocked so
-            // wait::tick() can find and wake it later.
+            // Re-queue the previous thread unless it has exited.
+            // Running -> Ready, Blocked stays Blocked, Dead is dropped.
             if current.state == ThreadState::Running {
                 current.state = ThreadState::Ready;
+                sched.run_queues[cpu_id].push_back(current);
+            } else if current.state == ThreadState::Blocked {
+                sched.run_queues[cpu_id].push_back(current);
             }
-            sched.run_queues[cpu_id].push_back(current);
             sched.current[cpu_id] = Some(next);
             cpu::set_current_pid(cpu_id, next_pid);
 
-            let old_ctx =
-                &mut sched.run_queues[cpu_id].back_mut().unwrap().context as *mut Context;
+            let old_ctx = if let Some(back) = sched.run_queues[cpu_id].back_mut() {
+                &mut back.context as *mut Context
+            } else {
+                core::ptr::null_mut()
+            };
             let new_ctx =
                 &sched.current[cpu_id].as_ref().unwrap().context as *const Context;
             Some((old_ctx, new_ctx, false, user_page_table))
@@ -213,3 +217,31 @@ pub fn send_resched_ipi(target_cpu: usize) {
     crate::arch::send_resched_ipi(target_cpu);
 }
 
+/// Mark the currently running thread as dead. The next `schedule()` call
+/// will drop it instead of re-queueing.
+pub fn mark_current_dead() {
+    let cpu_id = cpu::current_cpu_id();
+    let mut sched = SCHEDULER.lock();
+    if cpu_id < sched.num_cpus {
+        if let Some(curr) = sched.current[cpu_id].as_mut() {
+            curr.state = ThreadState::Dead;
+        }
+    }
+}
+
+/// Mark a set of thread IDs as dead across current + run queues.
+pub fn mark_threads_dead(pids: &[super::process::Pid]) {
+    let mut sched = SCHEDULER.lock();
+    for cpu in 0..sched.num_cpus {
+        if let Some(curr) = sched.current[cpu].as_mut() {
+            if pids.contains(&curr.pid) {
+                curr.state = ThreadState::Dead;
+            }
+        }
+        for th in sched.run_queues[cpu].iter_mut() {
+            if pids.contains(&th.pid) {
+                th.state = ThreadState::Dead;
+            }
+        }
+    }
+}

@@ -9,7 +9,7 @@
   - 原因: XFCE/GTK 生态通常基于 glibc 构建，glibc 提供最广泛的 Linux ABI 兼容性
   - 影响: 需要实现 glibc 依赖的全部 syscall（比 musl 多），包括 `clone3`, `rseq`, `memfd_create` 等
   - Rootfs: 基于 Debian/Ubuntu aarch64 glibc 根文件系统
-- **验证平台**: 主验证平台为 **AArch64** (qemu-system-aarch64)
+- **验证平台**: 主验证平台为 **X86-64** 
 - **引导**: Limine v8 引导协议，UEFI 启动
 - **内核架构**: 宏内核 (Monolithic)，驱动运行在内核态
 
@@ -308,7 +308,7 @@ make run ARCH=aarch64
 ```
 
 ## Verification Strategy
-- **主验证平台: AArch64** (qemu-system-aarch64)
+- **主验证平台: ** (qemu-system-aarch64)
 - 每个阶段优先在 AArch64 上验证通过，再移植验证 x86-64
 - 串口输出作为主要调试手段
 - Phase 4 后可运行 Linux 测试二进制

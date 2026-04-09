@@ -55,7 +55,7 @@ pub unsafe fn switch_to_new(new: &Context) {
 }
 
 /// Trampoline: called on a user thread's very first context switch.
-/// x19=entry, x20=SPSR, x21=SP_EL0, x22=TTBR0 (set by scheduler before switch).
+/// x19=entry, x20=SPSR, x21=SP_EL0, x22=TTBR0, x23=TPIDR_EL0 (TLS).
 #[unsafe(naked)]
 pub unsafe extern "C" fn return_to_user_trampoline() -> ! {
     core::arch::naked_asm!(
@@ -66,6 +66,7 @@ pub unsafe extern "C" fn return_to_user_trampoline() -> ! {
         "msr SPSel, #0",
         "mov sp, x21",
         "msr SPSel, #1",
+        "msr TPIDR_EL0, x23",
         "mov x0,  #0", "mov x1,  #0", "mov x2,  #0", "mov x3,  #0",
         "mov x4,  #0", "mov x5,  #0", "mov x6,  #0", "mov x7,  #0",
         "mov x8,  #0", "mov x9,  #0", "mov x10, #0", "mov x11, #0",

@@ -1,4 +1,4 @@
-use crate::arch::TrapFrame;
+use crate::arch::CpuContext;
 use super::{SyscallResult, ENOSYS, EINVAL};
 
 pub fn sys_rt_sigaction(signum: i32, act: u64, oldact: u64, sigsetsize: u64) -> SyscallResult {
@@ -9,7 +9,7 @@ pub fn sys_rt_sigprocmask(how: i32, set: u64, oldset: u64, sigsetsize: u64) -> S
     crate::ipc::signal::do_sigprocmask(how, set, oldset, sigsetsize as usize)
 }
 
-pub fn sys_rt_sigreturn(frame: &mut TrapFrame) -> SyscallResult {
+pub fn sys_rt_sigreturn(frame: &mut impl CpuContext) -> SyscallResult {
     crate::ipc::signal::do_sigreturn(frame)
 }
 
@@ -19,4 +19,8 @@ pub fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
 
 pub fn sys_tgkill(tgid: i32, tid: i32, sig: i32) -> SyscallResult {
     crate::ipc::signal::do_tgkill(tgid, tid, sig)
+}
+
+pub fn sys_sigaltstack(ss: u64, old_ss: u64) -> SyscallResult {
+    crate::ipc::signal::do_sigaltstack(ss, old_ss)
 }

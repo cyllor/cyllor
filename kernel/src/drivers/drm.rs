@@ -165,7 +165,7 @@ pub fn handle_ioctl(request: u64, arg: u64) -> SyscallResult {
                     0x2 => 0, // DRM_CAP_VBLANK_HIGH_CRTC
                     0x3 => 1, // DRM_CAP_DUMB_PREFERRED_DEPTH = 32
                     0x4 => 1, // DRM_CAP_DUMB_PREFER_SHADOW
-                    0x6 => 1, // DRM_CAP_PRIME
+                    0x6 => 0, // DRM_CAP_PRIME (not supported)
                     0x10 => 1, // DRM_CAP_TIMESTAMP_MONOTONIC
                     0x12 => 1, // DRM_CAP_ADDFB2_MODIFIERS
                     0x13 => 1, // DRM_CAP_CRTC_IN_VBLANK_EVENT
@@ -435,8 +435,8 @@ pub fn handle_ioctl(request: u64, arg: u64) -> SyscallResult {
         DRM_IOCTL_MODE_GETPROPERTY => Ok(0),
         // Return -EOPNOTSUPP so Weston falls back to legacy KMS instead of atomic
         DRM_IOCTL_MODE_ATOMIC => Err(crate::syscall::EOPNOTSUPP),
-        DRM_IOCTL_PRIME_HANDLE_TO_FD => Ok(0),
-        DRM_IOCTL_PRIME_FD_TO_HANDLE => Ok(0),
+        DRM_IOCTL_PRIME_HANDLE_TO_FD => Err(crate::syscall::EOPNOTSUPP),
+        DRM_IOCTL_PRIME_FD_TO_HANDLE => Err(crate::syscall::EOPNOTSUPP),
         DRM_IOCTL_GEM_CLOSE => Ok(0),
         DRM_IOCTL_WAIT_VBLANK => {
             static SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
@@ -452,7 +452,7 @@ pub fn handle_ioctl(request: u64, arg: u64) -> SyscallResult {
         }
         _ => {
             log::trace!("Unknown DRM ioctl: 0x{:x}", request);
-            Ok(0)
+            Err(crate::syscall::ENOTTY)
         }
     }
 }

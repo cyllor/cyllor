@@ -1,3 +1,51 @@
+/// Minimal execution context abstraction exposed to common code.
+/// Implemented by architecture-specific trap frame types.
+pub trait CpuContext {
+    fn reg(&self, idx: usize) -> u64;
+    fn set_reg(&mut self, idx: usize, val: u64);
+    fn pc(&self) -> u64;
+    fn set_pc(&mut self, val: u64);
+    fn sp(&self) -> u64;
+    fn set_sp(&mut self, val: u64);
+}
+
+/// Architecture-neutral page attribute description used by common code.
+#[derive(Debug, Clone, Copy)]
+pub struct PageAttr {
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+    pub user: bool,
+    pub device: bool,
+}
+
+impl PageAttr {
+    pub const USER_RWX: Self = Self { readable: true, writable: true, executable: true, user: true, device: false };
+    pub const USER_RW:  Self = Self { readable: true, writable: true, executable: false, user: true, device: false };
+    pub const USER_RX:  Self = Self { readable: true, writable: false, executable: true, user: true, device: false };
+    pub const USER_RO:  Self = Self { readable: true, writable: false, executable: false, user: true, device: false };
+    pub const KERNEL_RW:  Self = Self { readable: true, writable: true, executable: false, user: false, device: false };
+    pub const KERNEL_RWX: Self = Self { readable: true, writable: true, executable: true, user: false, device: false };
+    pub const DEVICE: Self = Self { readable: true, writable: true, executable: false, user: false, device: true };
+}
+
+/// Minimal operations common code needs from a user page table.
+pub trait PageTable {
+    fn root_phys(&self) -> u64;
+    fn map_anon(&self, virt_start: u64, size: usize, flags: PageAttr) -> Result<(), ()>;
+    fn copy_to_user(&self, virt: u64, data: &[u8]) -> Result<(), ()>;
+    fn copy_from_user(&self, virt: u64, buf: &mut [u8]) -> Result<(), ()>;
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn create_user_page_table() -> Option<Box<dyn PageTable + Send + Sync>> {
+    Some(Box::new(aarch64::paging::AddressSpace::new()?))
+}
+#[cfg(target_arch = "x86_64")]
+pub fn create_user_page_table() -> Option<Box<dyn PageTable + Send + Sync>> {
+    Some(Box::new(x86_64::AddressSpace::new()?))
+}
+
 #[allow(dead_code)]
 pub trait Arch {
     fn init_interrupts();
@@ -12,8 +60,6 @@ mod x86_64;
 pub use self::x86_64::X86Arch as PlatformArch;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::{early_init, memory_map};
-#[cfg(target_arch = "x86_64")]
-pub use self::x86_64::{TrapFrame, AddressSpace, PageFlags};
 #[cfg(target_arch = "x86_64")]
 pub const ARCH_NAME: &str = "x86_64";
 #[cfg(target_arch = "x86_64")]
@@ -43,10 +89,12 @@ pub const ARCH_NAME: &str = "aarch64";
 pub use self::aarch64::cpu_count;
 #[cfg(target_arch = "aarch64")]
 pub fn ticks() -> u64 { aarch64::exceptions::ticks() }
+#[cfg(not(target_arch = "aarch64"))]
+pub fn ticks() -> u64 { 0 }
 #[cfg(target_arch = "aarch64")]
 pub fn hhdm_offset() -> u64 { aarch64::hhdm_offset() }
-#[cfg(target_arch = "aarch64")]
-pub use self::aarch64::paging::{AddressSpace, PageFlags};
+#[cfg(not(target_arch = "aarch64"))]
+pub fn hhdm_offset() -> u64 { 0 }
 /// ELF e_machine value for the current architecture.
 #[cfg(target_arch = "aarch64")]
 pub const ELF_MACHINE: u16 = 183; // EM_AARCH64
@@ -192,7 +240,7 @@ pub fn uart_enable_rx_interrupt() { aarch64::uart_enable_rx_interrupt() }
 #[cfg(not(target_arch = "aarch64"))]
 pub fn uart_enable_rx_interrupt() {} // TODO: COM1 RX interrupt on x86_64
 
-/// Handle UART receive interrupt — drain FIFO, calling push_byte for each byte.
+/// Handle UART receive interrupt – drain FIFO, calling push_byte for each byte.
 #[cfg(target_arch = "aarch64")]
 pub fn uart_handle_rx_interrupt(push_byte: fn(u8)) { aarch64::uart_handle_rx_interrupt(push_byte) }
 #[cfg(not(target_arch = "aarch64"))]
@@ -200,8 +248,23 @@ pub fn uart_handle_rx_interrupt(_push_byte: fn(u8)) {}
 
 /// Map a single user page (phys → virt) in the page table rooted at root_phys.
 #[cfg(target_arch = "aarch64")]
-pub fn map_user_page(root_phys: u64, virt: u64, phys: u64, flags: PageFlags) {
+pub fn map_user_page(root_phys: u64, virt: u64, phys: u64, flags: PageAttr) {
     aarch64::paging::map_user_page(root_phys, virt, phys, flags)
 }
 #[cfg(not(target_arch = "aarch64"))]
-pub fn map_user_page(_root_phys: u64, _virt: u64, _phys: u64, _flags: PageFlags) {}
+pub fn map_user_page(_root_phys: u64, _virt: u64, _phys: u64, _flags: PageAttr) {}
+
+#[cfg(target_arch = "aarch64")]
+pub fn unmap_user_page(root_phys: u64, virt: u64) -> Option<u64> {
+    aarch64::paging::unmap_user_page(root_phys, virt)
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub fn unmap_user_page(_root_phys: u64, _virt: u64) -> Option<u64> { None }
+
+#[cfg(target_arch = "aarch64")]
+pub fn flush_user_tlb_va(virt: u64) {
+    aarch64::paging::flush_user_tlb_va(virt)
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub fn flush_user_tlb_va(_virt: u64) {}
+use alloc::boxed::Box;

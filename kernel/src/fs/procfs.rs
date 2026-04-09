@@ -24,9 +24,23 @@ pub fn build_self_dir() -> Arc<Mutex<Inode>> {
     let mut sd = self_dir.lock();
 
     let pid = crate::sched::process::current_pid();
-    let proc_name = {
+    let (proc_name, ppid, tgid, uid, euid, gid, egid, threads, environ_blob) = {
         let table = crate::sched::process::PROCESS_TABLE.lock();
-        table.get(&pid).map(|i| i.name.clone()).unwrap_or_else(|| "init".to_string())
+        if let Some(i) = table.get(&pid) {
+            (
+                i.name.clone(),
+                i.ppid,
+                i.tgid,
+                i.uid,
+                i.euid,
+                i.gid,
+                i.egid,
+                i.threads.len(),
+                i.environ.clone(),
+            )
+        } else {
+            ("init".to_string(), 0, pid, 0, 0, 0, 0, 1, alloc::vec::Vec::new())
+        }
     };
 
     // /proc/self/exe -> symlink to the executable (dynamic per-process)
@@ -43,16 +57,27 @@ pub fn build_self_dir() -> Arc<Mutex<Inode>> {
     cmdline.size = cmdline.data.len();
     sd.children.insert("cmdline".to_string(), Arc::new(Mutex::new(cmdline)));
 
-    // /proc/self/maps — generate from per-process VMM if available,
-    // otherwise return a minimal placeholder.
+    // /proc/self/maps — generate from process VMM when available.
     let maps_str = {
-        // Try to get the VMM from the Thread/scheduler infrastructure
-        // For now, generate a sensible default based on the ELF loader layout
-        alloc::format!(
-            "00400000-00401000 r-xp 00000000 00:00 0          {}\n\
-             7fffffffe000-7ffffffff000 rw-p 00000000 00:00 0          [stack]\n",
-            exe_path
-        )
+        let table = crate::sched::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.get(&pid) {
+            let rendered = proc.vmm.lock().maps_string();
+            if rendered.is_empty() {
+                alloc::format!(
+                    "00400000-00401000 r-xp 00000000 00:00 0          {}\n\
+                     7fffffffe000-7ffffffff000 rw-p 00000000 00:00 0          [stack]\n",
+                    exe_path
+                )
+            } else {
+                rendered
+            }
+        } else {
+            alloc::format!(
+                "00400000-00401000 r-xp 00000000 00:00 0          {}\n\
+                 7fffffffe000-7ffffffff000 rw-p 00000000 00:00 0          [stack]\n",
+                exe_path
+            )
+        }
     };
     let mut maps = Inode::new_file(0o444);
     maps.data = maps_str.into_bytes();
@@ -61,16 +86,45 @@ pub fn build_self_dir() -> Arc<Mutex<Inode>> {
 
     // /proc/self/status (dynamic)
     let status_str = alloc::format!(
-        "Name:\t{}\nPid:\t{}\nTgid:\t{}\nPPid:\t0\nUid:\t0 0 0 0\nGid:\t0 0 0 0\nVmRSS:\t4096 kB\nThreads:\t1\n",
-        proc_name, pid, pid,
+        "Name:\t{}\nPid:\t{}\nTgid:\t{}\nPPid:\t{}\nUid:\t{} {} {} {}\nGid:\t{} {} {} {}\nVmRSS:\t4096 kB\nThreads:\t{}\n",
+        proc_name, pid, tgid, ppid, uid, euid, uid, euid, gid, egid, gid, egid, threads,
     );
     let mut status = Inode::new_file(0o444);
     status.data = status_str.into_bytes();
     status.size = status.data.len();
     sd.children.insert("status".to_string(), Arc::new(Mutex::new(status)));
 
-    // /proc/self/fd -> directory (empty stub)
-    sd.children.insert("fd".to_string(), Arc::new(Mutex::new(Inode::new_dir(0o555))));
+    // /proc/self/fd -> directory (dynamic snapshot of open FDs)
+    let fd_dir = Arc::new(Mutex::new(Inode::new_dir(0o555)));
+    {
+        let mut fdn = fd_dir.lock();
+        for fd in crate::fs::fdtable::list_open_fds() {
+            let target = match crate::fs::fdtable::get_file(fd) {
+                Ok(f) => {
+                    let fo = f.lock();
+                    if let Some(ref inode) = fo.inode {
+                        let node = inode.lock();
+                        match node.itype {
+                            InodeType::CharDevice => "/dev/tty".to_string(),
+                            InodeType::Directory => ".".to_string(),
+                            _ => alloc::format!("/proc/self/fd/{fd}"),
+                        }
+                    } else {
+                        alloc::format!("anon_inode:{:?}", fo.ftype)
+                    }
+                }
+                Err(_) => alloc::format!("/proc/self/fd/{fd}"),
+            };
+
+            let mut link = Inode::new_file(0o777);
+            link.itype = InodeType::Symlink;
+            link.data = target.into_bytes();
+            link.size = link.data.len();
+            fdn.children
+                .insert(fd.to_string(), Arc::new(Mutex::new(link)));
+        }
+    }
+    sd.children.insert("fd".to_string(), fd_dir);
 
     // /proc/self/stat
     let stat_str = alloc::format!(
@@ -88,10 +142,16 @@ pub fn build_self_dir() -> Arc<Mutex<Inode>> {
     statm.size = statm.data.len();
     sd.children.insert("statm".to_string(), Arc::new(Mutex::new(statm)));
 
-    // /proc/self/mounts (empty)
-    sd.children.insert("mounts".to_string(), Arc::new(Mutex::new(Inode::new_file(0o444))));
-    // /proc/self/environ (empty)
-    sd.children.insert("environ".to_string(), Arc::new(Mutex::new(Inode::new_file(0o444))));
+    // /proc/self/mounts
+    let mut mounts = Inode::new_file(0o444);
+    mounts.data = b"rootfs / rootfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\ntmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n".to_vec();
+    mounts.size = mounts.data.len();
+    sd.children.insert("mounts".to_string(), Arc::new(Mutex::new(mounts)));
+    // /proc/self/environ (NUL-separated)
+    let mut environ = Inode::new_file(0o400);
+    environ.data = environ_blob;
+    environ.size = environ.data.len();
+    sd.children.insert("environ".to_string(), Arc::new(Mutex::new(environ)));
 
     // /proc/self/cgroup
     let mut cgroup = Inode::new_file(0o444);

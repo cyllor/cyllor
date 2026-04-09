@@ -11,6 +11,7 @@
 //   L3: bits [20:12] -> 512 entries, each covers 4KB (page)
 
 use crate::mm::pmm;
+use crate::arch::{PageAttr, PageTable as ArchPageTable};
 use core::ptr;
 
 const PAGE_SIZE: usize = 4096;
@@ -73,8 +74,8 @@ impl AddressSpace {
     }
 
     /// Map a virtual page to a physical page with given flags
-    pub fn map_page(&self, virt: u64, phys: u64, flags: PageFlags) -> Result<(), ()> {
-        let pte_flags = flags.to_pte();
+    pub fn map_page(&self, virt: u64, phys: u64, flags: PageAttr) -> Result<(), ()> {
+        let pte_flags = PageFlags::from(flags).to_pte();
         let indices = [
             ((virt >> 39) & 0x1FF) as usize, // L0
             ((virt >> 30) & 0x1FF) as usize, // L1
@@ -118,7 +119,7 @@ impl AddressSpace {
     }
 
     /// Map a contiguous range of virtual pages to physical pages
-    pub fn map_range(&self, virt_start: u64, phys_start: u64, size: usize, flags: PageFlags) -> Result<(), ()> {
+    pub fn map_range(&self, virt_start: u64, phys_start: u64, size: usize, flags: PageAttr) -> Result<(), ()> {
         let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
         for i in 0..pages {
             let offset = (i * PAGE_SIZE) as u64;
@@ -128,7 +129,7 @@ impl AddressSpace {
     }
 
     /// Map anonymous pages (allocate physical memory)
-    pub fn map_anon(&self, virt_start: u64, size: usize, flags: PageFlags) -> Result<(), ()> {
+    pub fn map_anon(&self, virt_start: u64, size: usize, flags: PageAttr) -> Result<(), ()> {
         let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
         log::debug!("map_anon: virt=0x{:x} pages={} root=0x{:x}", virt_start, pages, self.root_phys);
         for i in 0..pages {
@@ -263,6 +264,22 @@ impl AddressSpace {
     }
 }
 
+impl ArchPageTable for AddressSpace {
+    fn root_phys(&self) -> u64 { self.root_phys }
+
+    fn map_anon(&self, virt_start: u64, size: usize, flags: PageAttr) -> Result<(), ()> {
+        AddressSpace::map_anon(self, virt_start, size, flags)
+    }
+
+    fn copy_to_user(&self, virt: u64, data: &[u8]) -> Result<(), ()> {
+        AddressSpace::copy_to_user(self, virt, data)
+    }
+
+    fn copy_from_user(&self, virt: u64, buf: &mut [u8]) -> Result<(), ()> {
+        AddressSpace::copy_from_user(self, virt, buf)
+    }
+}
+
 impl Drop for AddressSpace {
     fn drop(&mut self) {
         // TODO: walk and free all page table pages and mapped pages
@@ -278,6 +295,18 @@ pub struct PageFlags {
     pub executable: bool,
     pub user: bool,
     pub device: bool,
+}
+
+impl From<PageAttr> for PageFlags {
+    fn from(attr: PageAttr) -> Self {
+        Self {
+            readable: attr.readable,
+            writable: attr.writable,
+            executable: attr.executable,
+            user: attr.user,
+            device: attr.device,
+        }
+    }
 }
 
 impl PageFlags {
@@ -415,10 +444,32 @@ pub fn translate_user_va(root_phys: u64, va: u64) -> Option<u64> {
 }
 
 /// Map a single user page (phys → virt) in the page table rooted at root_phys.
-pub fn map_user_page(root_phys: u64, virt: u64, phys: u64, flags: PageFlags) {
+pub fn map_user_page(root_phys: u64, virt: u64, phys: u64, flags: PageAttr) {
     let aspace = core::mem::ManuallyDrop::new(AddressSpace { root_phys });
-    let _ = aspace.map_page(virt, phys, flags);
+    let _ = aspace.map_page(virt, phys, flags.into());
     super::data_sync_barrier();
+}
+
+/// Unmap a single user page in the page table rooted at root_phys.
+/// Returns the unmapped physical page base when a mapping existed.
+pub fn unmap_user_page(root_phys: u64, virt: u64) -> Option<u64> {
+    let aspace = core::mem::ManuallyDrop::new(AddressSpace { root_phys });
+    let phys = aspace.unmap_page(virt);
+    super::data_sync_barrier();
+    phys
+}
+
+/// Invalidate TLB entry for one user virtual page.
+pub fn flush_user_tlb_va(virt: u64) {
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vale1is, {}",
+            "dsb ish",
+            "isb",
+            in(reg) virt >> 12,
+        );
+    }
 }
 
 /// Map a physical device MMIO range into TTBR1 (kernel HHDM space).
