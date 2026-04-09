@@ -6,7 +6,11 @@ mod signal;
 mod time;
 mod io;
 
-use crate::arch::TrapFrame;
+use crate::arch::CpuContext;
+
+pub fn current_creds() -> (u32, u32, u32, u32) {
+    process::current_creds()
+}
 
 // Linux syscall numbers (AArch64 numbering — must be updated per arch)
 mod nr {
@@ -17,6 +21,7 @@ mod nr {
     pub const FSTAT: u64 = 80;
     pub const EXIT: u64 = 93;
     pub const EXIT_GROUP: u64 = 94;
+    pub const WAITID: u64 = 95;
     pub const SET_TID_ADDRESS: u64 = 96;
     pub const CLOCK_GETTIME: u64 = 113;
     pub const NANOSLEEP: u64 = 101;
@@ -28,11 +33,23 @@ mod nr {
     pub const EXECVE: u64 = 221;
     pub const WAIT4: u64 = 260;
     pub const GETPID: u64 = 172;
+    pub const GETPPID: u64 = 173;
     pub const GETUID: u64 = 174;
     pub const GETGID: u64 = 176;
     pub const GETEUID: u64 = 175;
     pub const GETEGID: u64 = 177;
+    pub const SETGID: u64 = 144;
+    pub const SETUID: u64 = 146;
+    pub const SETRESUID: u64 = 147;
+    pub const GETRESUID: u64 = 148;
+    pub const SETRESGID: u64 = 149;
+    pub const GETRESGID: u64 = 150;
     pub const GETTID: u64 = 178;
+    pub const SETPGID: u64 = 154;
+    pub const GETPGID: u64 = 155;
+    pub const GETSID: u64 = 156;
+    pub const SETSID: u64 = 157;
+    pub const GETPGRP: u64 = 106;
     pub const IOCTL: u64 = 29;
     pub const WRITEV: u64 = 66;
     pub const READV: u64 = 65;
@@ -42,12 +59,17 @@ mod nr {
     pub const DUP3: u64 = 24;
     pub const PIPE2: u64 = 59;
     pub const SOCKET: u64 = 198;
+    pub const SOCKETPAIR: u64 = 199;
     pub const BIND: u64 = 200;
     pub const LISTEN: u64 = 201;
     pub const ACCEPT4: u64 = 242;
     pub const CONNECT: u64 = 203;
     pub const SENDTO: u64 = 206;
     pub const RECVFROM: u64 = 207;
+    pub const SENDMSG: u64 = 211;
+    pub const RECVMSG: u64 = 212;
+    pub const RECVMMSG: u64 = 243;
+    pub const SENDMMSG: u64 = 269;
     pub const SETSOCKOPT: u64 = 208;
     pub const GETSOCKOPT: u64 = 209;
     pub const GETCWD: u64 = 17;
@@ -103,15 +125,15 @@ mod nr {
 }
 
 /// Handle a syscall from userspace
-pub fn handle(frame: &mut TrapFrame) {
-    let syscall_nr = frame.regs[8]; // x8 = syscall number
+pub fn handle(frame: &mut impl CpuContext) {
+    let syscall_nr = frame.reg(8); // x8 = syscall number on AArch64
     let args = [
-        frame.regs[0], // x0
-        frame.regs[1], // x1
-        frame.regs[2], // x2
-        frame.regs[3], // x3
-        frame.regs[4], // x4
-        frame.regs[5], // x5
+        frame.reg(0), // x0
+        frame.reg(1), // x1
+        frame.reg(2), // x2
+        frame.reg(3), // x3
+        frame.reg(4), // x4
+        frame.reg(5), // x5
     ];
 
     // Trace syscalls
@@ -135,6 +157,8 @@ pub fn handle(frame: &mut TrapFrame) {
         nr::CHDIR => fs::sys_chdir(args[0]),
         nr::MKDIRAT => fs::sys_mkdirat(args[0] as i32, args[1], args[2] as u32),
         nr::UNLINKAT => fs::sys_unlinkat(args[0] as i32, args[1], args[2] as u32),
+        nr::RENAMEAT2 => fs::sys_renameat2(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32),
+        nr::STATX => fs::sys_statx(args[0] as i32, args[1], args[2] as u32, args[3] as u32, args[4]),
         nr::WRITEV => fs::sys_writev(args[0] as u32, args[1], args[2] as u32),
         nr::READV => fs::sys_readv(args[0] as u32, args[1], args[2] as u32),
         nr::DUP => fs::sys_dup(args[0] as u32),
@@ -145,12 +169,27 @@ pub fn handle(frame: &mut TrapFrame) {
         nr::EXIT => process::sys_exit(args[0] as i32),
         nr::EXIT_GROUP => process::sys_exit_group(args[0] as i32),
         nr::GETPID => process::sys_getpid(),
+        nr::GETPPID => process::sys_getppid(),
         nr::GETTID => process::sys_gettid(),
-        nr::GETUID | nr::GETEUID => Ok(0), // root
-        nr::GETGID | nr::GETEGID => Ok(0), // root
-        nr::CLONE => process::sys_clone(args[0], args[1], args[2], args[3], args[4]),
-        nr::EXECVE => process::sys_execve(args[0], args[1], args[2]),
+        nr::GETPGRP => process::sys_getpgrp(),
+        nr::GETPGID => process::sys_getpgid(args[0] as i32),
+        nr::GETSID => process::sys_getsid(args[0] as i32),
+        nr::SETPGID => process::sys_setpgid(args[0] as i32, args[1] as i32),
+        nr::SETSID => process::sys_setsid(),
+        nr::GETUID => process::sys_getuid(),
+        nr::GETEUID => process::sys_geteuid(),
+        nr::GETGID => process::sys_getgid(),
+        nr::GETEGID => process::sys_getegid(),
+        nr::SETUID => process::sys_setuid(args[0] as u32),
+        nr::SETGID => process::sys_setgid(args[0] as u32),
+        nr::GETRESUID => process::sys_getresuid(args[0], args[1], args[2]),
+        nr::GETRESGID => process::sys_getresgid(args[0], args[1], args[2]),
+        nr::SETRESUID => process::sys_setresuid(args[0] as i32, args[1] as i32, args[2] as i32),
+        nr::SETRESGID => process::sys_setresgid(args[0] as i32, args[1] as i32, args[2] as i32),
+        nr::CLONE => process::sys_clone(frame, args[0], args[1], args[2], args[3], args[4]),
+        nr::EXECVE => process::sys_execve(frame, args[0], args[1], args[2]),
         nr::WAIT4 => process::sys_wait4(args[0] as i32, args[1], args[2] as u32, args[3]),
+        nr::WAITID => process::sys_waitid(args[0] as i32, args[1] as u32, args[2], args[3] as u32, args[4]),
         nr::SET_TID_ADDRESS => process::sys_set_tid_address(args[0]),
         nr::SCHED_YIELD => { crate::sched::timer_tick(); Ok(0) }
 
@@ -176,35 +215,50 @@ pub fn handle(frame: &mut TrapFrame) {
         nr::EPOLL_PWAIT => io::sys_epoll_pwait(args[0] as i32, args[1], args[2] as i32, args[3] as i32, args[4]),
         nr::EVENTFD2 => io::sys_eventfd2(args[0] as u32, args[1] as u32),
         nr::FUTEX => io::sys_futex(args[0], args[1] as i32, args[2] as u32, args[3], args[4], args[5] as u32),
+        nr::TIMERFD_CREATE => io::sys_timerfd_create(args[0] as i32, args[1] as i32),
+        nr::TIMERFD_SETTIME => io::sys_timerfd_settime(args[0] as i32, args[1] as i32, args[2], args[3]),
+        nr::SIGNALFD4 => io::sys_signalfd4(args[0] as i32, args[1], args[2] as usize, args[3] as i32),
 
         nr::SOCKET => net::sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
+        nr::SOCKETPAIR => net::sys_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3]),
         nr::BIND => net::sys_bind(args[0] as i32, args[1], args[2] as u32),
         nr::LISTEN => net::sys_listen(args[0] as i32, args[1] as i32),
         nr::ACCEPT4 => net::sys_accept4(args[0] as i32, args[1], args[2], args[3] as u32),
         nr::CONNECT => net::sys_connect(args[0] as i32, args[1], args[2] as u32),
         nr::SENDTO => net::sys_sendto(args[0] as i32, args[1], args[2], args[3] as u32, args[4], args[5] as u32),
         nr::RECVFROM => net::sys_recvfrom(args[0] as i32, args[1], args[2], args[3] as u32, args[4], args[5]),
+        nr::SENDMSG => net::sys_sendmsg(args[0] as i32, args[1], args[2] as u32),
+        nr::RECVMSG => net::sys_recvmsg(args[0] as i32, args[1], args[2] as u32),
+        nr::SENDMMSG => net::sys_sendmmsg(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
+        nr::RECVMMSG => net::sys_recvmmsg(args[0] as i32, args[1], args[2] as u32, args[3] as u32, args[4]),
+        nr::SETSOCKOPT => net::sys_setsockopt(args[0] as i32, args[1] as i32, args[2] as i32, args[3], args[4] as u32),
+        nr::GETSOCKOPT => net::sys_getsockopt(args[0] as i32, args[1] as i32, args[2] as i32, args[3], args[4]),
 
         nr::GETRANDOM => mm::sys_getrandom(args[0], args[1], args[2] as u32),
         nr::PRLIMIT64 => process::sys_prlimit64(args[0] as i32, args[1] as u32, args[2], args[3]),
-        nr::SET_ROBUST_LIST => Ok(0),
-        nr::GET_ROBUST_LIST => Err(ENOSYS),
+        nr::SET_ROBUST_LIST => process::sys_set_robust_list(args[0], args[1]),
+        nr::GET_ROBUST_LIST => process::sys_get_robust_list(args[0] as i32, args[1], args[2]),
         nr::MEMFD_CREATE => mm::sys_memfd_create(args[0], args[1] as u32),
 
-        // glibc required stubs
-        nr::RSEQ => Err(ENOSYS), // glibc handles ENOSYS gracefully
-        nr::CLONE3 => Err(ENOSYS), // falls back to clone
+        // glibc compatibility-critical syscalls
+        nr::RSEQ => process::sys_rseq(args[0], args[1], args[2], args[3]),
+        nr::CLONE3 => process::sys_clone3(frame, args[0], args[1]),
         nr::PRCTL => process::sys_prctl(args[0] as i32, args[1], args[2], args[3], args[4]),
         nr::UNAME => process::sys_uname(args[0]),
         nr::GETDENTS64 => fs::sys_getdents64(args[0] as u32, args[1], args[2] as u32),
         nr::READLINKAT => fs::sys_readlinkat(args[0] as i32, args[1], args[2], args[3] as u32),
-        nr::FACCESSAT | nr::FACCESSAT2 => Ok(0), // pretend everything is accessible
+        nr::ACCESS => fs::sys_access(args[0], args[1] as u32),
+        nr::FACCESSAT | nr::FACCESSAT2 => fs::sys_faccessat(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
         nr::FSTATFS | nr::STATFS => process::sys_statfs(args[0], args[1]),
         nr::MREMAP => mm::sys_mremap(args[0], args[1], args[2], args[3] as u32, args[4]),
         nr::MADVISE => Ok(0), // advisory, ignore
-        nr::SIGALTSTACK => Ok(0), // stub
-        nr::GETSOCKNAME => Ok(0),
-        nr::GETPEERNAME => Err(ENOTSOCK),
+        nr::SIGALTSTACK => signal::sys_sigaltstack(args[0], args[1]),
+        nr::GETSOCKNAME => net::sys_getsockname(args[0] as i32, args[1], args[2]),
+        nr::GETPEERNAME => net::sys_getpeername(args[0] as i32, args[1], args[2]),
+        nr::SHMGET => mm::sys_shmget(args[0] as i32, args[1], args[2] as i32),
+        nr::SHMAT => mm::sys_shmat(args[0] as i32, args[1], args[2] as i32),
+        nr::SHMCTL => mm::sys_shmctl(args[0] as i32, args[1] as i32, args[2]),
+        nr::SHMDT => mm::sys_shmdt(args[0]),
 
         _ => {
             log::warn!("Unimplemented syscall: {syscall_nr}");
@@ -217,11 +271,20 @@ pub fn handle(frame: &mut TrapFrame) {
         Ok(val) => val as u64,
         Err(errno) => (-errno as i64) as u64,
     };
-    frame.regs[0] = ret;
+    frame.set_reg(0, ret);
+    crate::ipc::signal::dispatch_pending(frame);
     crate::drivers::uart::write_byte(b']');
 }
 
 pub type SyscallResult = Result<usize, i32>;
+
+pub fn register_clear_child_tid(tid: u64, tidptr: u64) {
+    process::register_clear_child_tid(tid, tidptr);
+}
+
+pub fn cleanup_thread_state(tid: u64) {
+    process::cleanup_thread_state(tid);
+}
 
 // Error codes
 pub const EPERM: i32 = 1;
@@ -240,6 +303,7 @@ pub const EEXIST: i32 = 17;
 pub const ENOTDIR: i32 = 20;
 pub const EISDIR: i32 = 21;
 pub const EINVAL: i32 = 22;
+pub const ENOTTY: i32 = 25;
 pub const EMFILE: i32 = 24;
 pub const ENFILE: i32 = 23;
 pub const ENOSPC: i32 = 28;
@@ -250,4 +314,15 @@ pub const ENOTEMPTY: i32 = 39;
 pub const ENOTSOCK: i32 = 88;
 pub const EOPNOTSUPP: i32 = 95;
 pub const EAFNOSUPPORT: i32 = 97;
+pub const EADDRINUSE: i32 = 98;
+pub const EISCONN: i32 = 106;
+pub const ENOTCONN: i32 = 107;
+pub const ETIMEDOUT: i32 = 110;
 pub const ECONNREFUSED: i32 = 111;
+
+// poll event flags
+pub const POLLIN: u32 = 0x0001;
+pub const POLLOUT: u32 = 0x0004;
+pub const POLLERR: u32 = 0x0008;
+pub const POLLHUP: u32 = 0x0010;
+pub const POLLNVAL: u32 = 0x0020;

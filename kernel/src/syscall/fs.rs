@@ -1,4 +1,24 @@
-use super::{SyscallResult, EBADF, ENOSYS, EINVAL};
+use super::{SyscallResult, EBADF, ENOSYS, EINVAL, ENOTDIR};
+use alloc::string::ToString;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct IovecRaw {
+    base: u64,
+    len: u64,
+}
+
+fn read_iovec(iov: u64, index: u32) -> Result<IovecRaw, i32> {
+    let mut raw = IovecRaw::default();
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(
+            (&mut raw as *mut IovecRaw).cast::<u8>(),
+            core::mem::size_of::<IovecRaw>(),
+        )
+    };
+    copy_from_user(iov + (index as u64) * 16, buf)?;
+    Ok(raw)
+}
 
 pub fn sys_write(fd: u64, buf: u64, count: u64) -> SyscallResult {
     // Always translate user VA → kernel VA via page table walk
@@ -16,19 +36,20 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> SyscallResult {
         let kva = pa + hhdm;
         let page_remaining = 4096 - (kva & 0xFFF) as usize;
         let chunk = page_remaining.min(count as usize - written);
-        let slice = unsafe { core::slice::from_raw_parts(kva as *const u8, chunk) };
-
-        // Write to fd
-        // Write to UART for fd 0/1/2, VFS for others
-        if fd <= 2 {
-            for &b in slice {
-                crate::drivers::uart::write_byte(b);
+        let n = match crate::fs::fd_write(fd as u32, kva, chunk) {
+            Ok(n) => n,
+            Err(errno) => {
+                if written > 0 {
+                    return Ok(written);
+                }
+                return Err(errno);
             }
-        } else {
-            let _ = crate::fs::fd_write(fd as u32, kva, chunk);
+        };
+        written += n;
+        uaddr += n as u64;
+        if n < chunk {
+            break;
         }
-        written += chunk;
-        uaddr += chunk as u64;
     }
     Ok(written)
 }
@@ -107,14 +128,35 @@ pub fn sys_unlinkat(dirfd: i32, pathname: u64, flags: u32) -> SyscallResult {
     crate::fs::unlinkat(dirfd, path, flags)
 }
 
+pub fn sys_renameat2(olddirfd: i32, oldpath: u64, newdirfd: i32, newpath: u64, flags: u32) -> SyscallResult {
+    let oldp = unsafe { cstr_from_user(oldpath)? };
+    let newp = unsafe { cstr_from_user(newpath)? };
+    crate::fs::renameat2(olddirfd, oldp, newdirfd, newp, flags)
+}
+
+pub fn sys_faccessat(dirfd: i32, pathname: u64, mode: u32, flags: u32) -> SyscallResult {
+    let path = unsafe { cstr_from_user(pathname)? };
+    crate::fs::faccessat(dirfd, path, mode, flags)
+}
+
+pub fn sys_access(pathname: u64, mode: u32) -> SyscallResult {
+    // access(path, mode) behaves like faccessat(AT_FDCWD, path, mode, 0)
+    const AT_FDCWD: i32 = -100;
+    let path = unsafe { cstr_from_user(pathname)? };
+    crate::fs::faccessat(AT_FDCWD, path, mode, 0)
+}
+
+pub fn sys_statx(dirfd: i32, pathname: u64, flags: u32, mask: u32, statxbuf: u64) -> SyscallResult {
+    let path = unsafe { cstr_from_user(pathname)? };
+    crate::fs::statx(dirfd, path, flags, mask, statxbuf)
+}
+
 pub fn sys_writev(fd: u32, iov: u64, iovcnt: u32) -> SyscallResult {
     let mut total = 0usize;
     for i in 0..iovcnt {
-        let iovec_ptr = iov + (i as u64) * 16;
-        let base = unsafe { *(iovec_ptr as *const u64) };
-        let len = unsafe { *((iovec_ptr + 8) as *const u64) };
-        if len > 0 {
-            total += sys_write(fd as u64, base, len)?;
+        let ent = read_iovec(iov, i)?;
+        if ent.len > 0 {
+            total += sys_write(fd as u64, ent.base, ent.len)?;
         }
     }
     Ok(total)
@@ -123,11 +165,9 @@ pub fn sys_writev(fd: u32, iov: u64, iovcnt: u32) -> SyscallResult {
 pub fn sys_readv(fd: u32, iov: u64, iovcnt: u32) -> SyscallResult {
     let mut total = 0usize;
     for i in 0..iovcnt {
-        let iovec_ptr = iov + (i as u64) * 16;
-        let base = unsafe { *(iovec_ptr as *const u64) };
-        let len = unsafe { *((iovec_ptr + 8) as *const u64) };
-        if len > 0 {
-            total += sys_read(fd as u64, base, len)?;
+        let ent = read_iovec(iov, i)?;
+        if ent.len > 0 {
+            total += sys_read(fd as u64, ent.base, ent.len)?;
         }
     }
     Ok(total)
@@ -178,7 +218,7 @@ pub fn copy_to_user(user_addr: u64, data: &[u8]) -> Result<(), i32> {
                 unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, 4096); }
                 crate::arch::map_user_page(
                     ttbr0, page_addr, phys,
-                    crate::arch::PageFlags::USER_RW,
+                    crate::arch::PageAttr::USER_RW,
                 );
                 // Retry this offset
             }
@@ -224,8 +264,82 @@ pub fn print_hex(val: u64) {
 }
 
 pub fn sys_getdents64(fd: u32, dirp: u64, count: u32) -> SyscallResult {
-    // Return 0 = end of directory
-    Ok(0)
+    if dirp == 0 || count == 0 {
+        return Err(EINVAL);
+    }
+
+    const DT_UNKNOWN: u8 = 0;
+    const DT_FIFO: u8 = 1;
+    const DT_CHR: u8 = 2;
+    const DT_DIR: u8 = 4;
+    const DT_BLK: u8 = 6;
+    const DT_REG: u8 = 8;
+    const DT_LNK: u8 = 10;
+    const DT_SOCK: u8 = 12;
+
+    fn align8(v: usize) -> usize {
+        (v + 7) & !7
+    }
+
+    fn inode_type_to_dtype(t: crate::fs::vfs::InodeType) -> u8 {
+        match t {
+            crate::fs::vfs::InodeType::Directory => DT_DIR,
+            crate::fs::vfs::InodeType::File => DT_REG,
+            crate::fs::vfs::InodeType::CharDevice => DT_CHR,
+            crate::fs::vfs::InodeType::BlockDevice => DT_BLK,
+            crate::fs::vfs::InodeType::Pipe => DT_FIFO,
+            crate::fs::vfs::InodeType::Socket => DT_SOCK,
+            crate::fs::vfs::InodeType::Symlink => DT_LNK,
+        }
+    }
+
+    let file = crate::fs::fdtable::get_file(fd)?;
+    let mut f = file.lock();
+    if f.ftype != crate::fs::vfs::FileType::Directory {
+        return Err(ENOTDIR);
+    }
+    let inode = f.inode.clone().ok_or(EINVAL)?;
+    let entries: alloc::vec::Vec<(alloc::string::String, u8)> = {
+        let node = inode.lock();
+        let mut out = alloc::vec![
+            (".".to_string(), DT_DIR),
+            ("..".to_string(), DT_DIR),
+        ];
+        out.extend(node.children.iter().map(|(name, child)| {
+            let ty = inode_type_to_dtype(child.lock().itype);
+            (name.clone(), ty)
+        }));
+        out
+    };
+
+    let mut written = 0usize;
+    let mut idx = f.offset;
+    let max = count as usize;
+    while idx < entries.len() {
+        let (name, dtype) = &entries[idx];
+        let name_bytes = name.as_bytes();
+        let reclen = align8(19 + name_bytes.len() + 1);
+        if written + reclen > max {
+            break;
+        }
+
+        let mut rec = alloc::vec![0u8; reclen];
+        // linux_dirent64
+        // 0..8: d_ino, 8..16: d_off, 16..18: d_reclen, 18: d_type, 19..: d_name\0
+        rec[0..8].copy_from_slice(&((idx + 1) as u64).to_le_bytes());
+        rec[8..16].copy_from_slice(&((idx + 1) as i64).to_le_bytes());
+        rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        rec[18] = *dtype;
+        rec[19..19 + name_bytes.len()].copy_from_slice(name_bytes);
+        rec[19 + name_bytes.len()] = 0;
+
+        copy_to_user(dirp + written as u64, &rec)?;
+        written += reclen;
+        idx += 1;
+    }
+
+    f.offset = idx;
+    Ok(written)
 }
 
 pub fn sys_readlinkat(dirfd: i32, pathname: u64, buf: u64, bufsiz: u32) -> SyscallResult {

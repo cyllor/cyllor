@@ -86,7 +86,10 @@ pub enum FileType {
     Pipe,
     Epoll,
     EventFd,
+    TimerFd,
+    SignalFd,
     MemFd,
+    PidFd,
     Socket,
     PtyMaster,
     PtySlave,
@@ -94,8 +97,15 @@ pub enum FileType {
 
 pub enum SpecialData {
     EventFdVal(u64),
+    TimerFdState {
+        next_deadline: u64,
+        interval_ticks: u64,
+        pending_expirations: u64,
+    },
+    SignalFdMask(u64),
     PipeBuffer(Arc<Mutex<Vec<u8>>>),
     MemFdData(Vec<u8>),
+    PidFd(u64),
     PtyMaster(u32),
     PtySlave(u32),
 }
@@ -123,10 +133,44 @@ impl FileObject {
         }
     }
 
+    pub fn new_timerfd() -> Self {
+        Self {
+            inode: None,
+            offset: 0,
+            flags: 0,
+            ftype: FileType::TimerFd,
+            special_data: Some(SpecialData::TimerFdState {
+                next_deadline: 0,
+                interval_ticks: 0,
+                pending_expirations: 0,
+            }),
+        }
+    }
+
+    pub fn new_signalfd(mask: u64) -> Self {
+        Self {
+            inode: None,
+            offset: 0,
+            flags: 0,
+            ftype: FileType::SignalFd,
+            special_data: Some(SpecialData::SignalFdMask(mask)),
+        }
+    }
+
     pub fn new_memfd() -> Self {
         Self {
             inode: None, offset: 0, flags: 0, ftype: FileType::MemFd,
             special_data: Some(SpecialData::MemFdData(Vec::new())),
+        }
+    }
+
+    pub fn new_pidfd(pid: u64) -> Self {
+        Self {
+            inode: None,
+            offset: 0,
+            flags: 0,
+            ftype: FileType::PidFd,
+            special_data: Some(SpecialData::PidFd(pid)),
         }
     }
 
@@ -171,8 +215,11 @@ impl FileObject {
             }
             FileType::CharDevice => {
                 if let Some(ref inode) = self.inode {
-                    let node = inode.lock();
-                    match (node.dev_major, node.dev_minor) {
+                    let (dev_major, dev_minor) = {
+                        let node = inode.lock();
+                        (node.dev_major, node.dev_minor)
+                    };
+                    match (dev_major, dev_minor) {
                         (1, 3) => Ok(0), // /dev/null
                         (1, 5) => { // /dev/zero
                             if count > 0 {
@@ -199,7 +246,26 @@ impl FileObject {
                             let n = crate::drivers::drm::read_events(buf, count);
                             Ok(n)
                         }
-                        (5, _) => Err(crate::syscall::EAGAIN), // /dev/tty
+                        (5, _) => {
+                            // /dev/tty behaves like the console slave PTY.
+                            let pty_id = crate::drivers::pty::console_pty_id();
+                            loop {
+                                if let Some(pty_arc) = crate::drivers::pty::get_pty(pty_id) {
+                                    let pty = pty_arc.lock();
+                                    let mut rb = pty.slave_rx.lock();
+                                    if !rb.is_empty() {
+                                        let to_read = count.min(rb.len());
+                                        let _ = crate::syscall::fs::copy_to_user(buf, &rb[..to_read]);
+                                        rb.drain(..to_read);
+                                        break Ok(to_read);
+                                    }
+                                }
+                                if self.flags & 0o4000 != 0 {
+                                    break Err(crate::syscall::EAGAIN);
+                                }
+                                crate::sched::wait::sleep_ticks(1);
+                            }
+                        }
                         _ => Ok(0),
                     }
                 } else {
@@ -231,6 +297,64 @@ impl FileObject {
                     Ok(0)
                 }
             }
+            FileType::TimerFd => {
+                if count < 8 {
+                    return Err(EINVAL);
+                }
+                loop {
+                    let now = crate::arch::read_counter();
+                    if let Some(SpecialData::TimerFdState {
+                        ref mut next_deadline,
+                        interval_ticks,
+                        ref mut pending_expirations,
+                    }) = self.special_data
+                    {
+                        if *next_deadline != 0 && now >= *next_deadline {
+                            if interval_ticks == 0 {
+                                *pending_expirations = pending_expirations.saturating_add(1);
+                                *next_deadline = 0;
+                            } else {
+                                let delta = now.saturating_sub(*next_deadline);
+                                let periods = delta / interval_ticks + 1;
+                                *pending_expirations = pending_expirations.saturating_add(periods);
+                                *next_deadline = next_deadline.saturating_add(periods.saturating_mul(interval_ticks));
+                            }
+                        }
+                        if *pending_expirations > 0 {
+                            let out = *pending_expirations;
+                            *pending_expirations = 0;
+                            let bytes = out.to_ne_bytes();
+                            let _ = crate::syscall::fs::copy_to_user(buf, &bytes);
+                            return Ok(8);
+                        }
+                    }
+                    if self.flags & 0o4000 != 0 {
+                        return Err(crate::syscall::EAGAIN);
+                    }
+                    crate::sched::wait::sleep_ticks(1);
+                }
+            }
+            FileType::SignalFd => {
+                if count < 128 {
+                    return Err(EINVAL);
+                }
+                let mask = match self.special_data {
+                    Some(SpecialData::SignalFdMask(m)) => m,
+                    _ => 0,
+                };
+                loop {
+                    if let Some(sig) = crate::ipc::signal::signalfd_consume(mask) {
+                        let mut info = [0u8; 128];
+                        info[0..4].copy_from_slice(&(sig as u32).to_le_bytes()); // ssi_signo
+                        crate::syscall::fs::copy_to_user(buf, &info).map_err(|_| EINVAL)?;
+                        return Ok(128);
+                    }
+                    if self.flags & 0o4000 != 0 {
+                        return Err(crate::syscall::EAGAIN);
+                    }
+                    crate::sched::wait::sleep_ticks(1);
+                }
+            }
             FileType::PtyMaster => {
                 let pty_id = match &self.special_data {
                     Some(SpecialData::PtyMaster(id)) => *id,
@@ -249,7 +373,7 @@ impl FileObject {
                     }
                     // Non-blocking check
                     if self.flags & 0o4000 != 0 { return Err(crate::syscall::EAGAIN); }
-                    crate::sched::timer_tick();
+                    crate::sched::wait::sleep_ticks(1);
                 }
             }
             FileType::PtySlave => {
@@ -269,7 +393,7 @@ impl FileObject {
                         }
                     }
                     if self.flags & 0o4000 != 0 { return Err(crate::syscall::EAGAIN); }
-                    crate::sched::timer_tick();
+                    crate::sched::wait::sleep_ticks(1);
                 }
             }
             _ => Ok(0),
@@ -328,6 +452,7 @@ impl FileObject {
                 }
                 Ok(8)
             }
+            FileType::TimerFd | FileType::SignalFd => Err(crate::syscall::EINVAL),
             FileType::PtyMaster => {
                 // Master write → line discipline → slave_rx
                 if let Some(SpecialData::PtyMaster(id)) = &self.special_data {
@@ -476,7 +601,17 @@ impl FileObject {
                 0x540E => { // TIOCSCTTY
                     if let Some(pty_arc) = crate::drivers::pty::get_pty(id) {
                         let mut pty = pty_arc.lock();
-                        pty.session = 1; // simplified: use pid 1
+                        let caller = crate::sched::process::current_pid();
+                        let (sid, pgid) = {
+                            let table = crate::sched::process::PROCESS_TABLE.lock();
+                            if let Some(proc) = table.get(&caller) {
+                                (proc.sid as i32, proc.pgid as i32)
+                            } else {
+                                (caller as i32, caller as i32)
+                            }
+                        };
+                        pty.session = sid;
+                        pty.fg_pgrp = pgid;
                     }
                     return Ok(0);
                 }
@@ -599,7 +734,23 @@ impl FileObject {
                 Ok(0)
             }
             0x5407 | 0x540B => Ok(0), // TCSETAF, TCFLSH
-            0x540E => Ok(0), // TIOCSCTTY
+            0x540E => {
+                if let Some(pty_arc) = crate::drivers::pty::get_pty(console_id) {
+                    let mut pty = pty_arc.lock();
+                    let caller = crate::sched::process::current_pid();
+                    let (sid, pgid) = {
+                        let table = crate::sched::process::PROCESS_TABLE.lock();
+                        if let Some(proc) = table.get(&caller) {
+                            (proc.sid as i32, proc.pgid as i32)
+                        } else {
+                            (caller as i32, caller as i32)
+                        }
+                    };
+                    pty.session = sid;
+                    pty.fg_pgrp = pgid;
+                }
+                Ok(0)
+            }
             0x540F => { // TIOCGPGRP
                 if arg != 0 {
                     if let Some(pty_arc) = crate::drivers::pty::get_pty(console_id) {
@@ -661,7 +812,7 @@ impl FileObject {
                 if arg != 0 { unsafe { *(arg as *mut i32) = 0; } }
                 Ok(0)
             }
-            _ => Ok(0), // Accept unknown ioctls silently
+            _ => Err(crate::syscall::ENOTTY),
         }
     }
 }
@@ -829,6 +980,83 @@ pub fn unlink(path: &str, flags: u32) -> SyscallResult {
     } else {
         Err(ENOENT)
     }
+}
+
+/// Best-effort absolute path reconstruction for an inode by walking from root.
+/// Returns None when the inode is not reachable from the current VFS tree.
+pub fn path_of_inode(target: &Arc<Mutex<Inode>>) -> Option<String> {
+    let root_node = root();
+    if Arc::ptr_eq(&root_node, target) {
+        return Some("/".to_string());
+    }
+
+    let mut stack: Vec<(Arc<Mutex<Inode>>, String)> = Vec::new();
+    stack.push((root_node, "/".to_string()));
+
+    while let Some((node, path)) = stack.pop() {
+        if Arc::ptr_eq(&node, target) {
+            return Some(path);
+        }
+
+        let children: Vec<(String, Arc<Mutex<Inode>>)> = {
+            let n = node.lock();
+            if n.itype != InodeType::Directory {
+                Vec::new()
+            } else {
+                n.children
+                    .iter()
+                    .map(|(name, child)| (name.clone(), child.clone()))
+                    .collect()
+            }
+        };
+
+        for (name, child) in children {
+            let child_path = if path == "/" {
+                alloc::format!("/{}", name)
+            } else {
+                alloc::format!("{}/{}", path, name)
+            };
+            stack.push((child, child_path));
+        }
+    }
+
+    None
+}
+
+pub fn rename(old_path: &str, new_path: &str, flags: u32) -> SyscallResult {
+    const RENAME_NOREPLACE: u32 = 1;
+    if (flags & !RENAME_NOREPLACE) != 0 {
+        return Err(EINVAL);
+    }
+    let (old_parent_path, old_name) = rsplit_path(old_path);
+    let (new_parent_path, new_name) = rsplit_path(new_path);
+    if old_name.is_empty() || new_name.is_empty() {
+        return Err(EINVAL);
+    }
+
+    let old_parent = resolve_path(old_parent_path)?;
+    let new_parent = resolve_path(new_parent_path)?;
+
+    if Arc::ptr_eq(&old_parent, &new_parent) {
+        let mut p = old_parent.lock();
+        if (flags & RENAME_NOREPLACE) != 0 && p.children.contains_key(new_name) {
+            return Err(EEXIST);
+        }
+        let moved = p.children.remove(old_name).ok_or(ENOENT)?;
+        p.children.insert(new_name.to_string(), moved);
+        return Ok(0);
+    }
+
+    let moved = {
+        let mut op = old_parent.lock();
+        op.children.remove(old_name).ok_or(ENOENT)?
+    };
+    let mut np = new_parent.lock();
+    if (flags & RENAME_NOREPLACE) != 0 && np.children.contains_key(new_name) {
+        return Err(EEXIST);
+    }
+    np.children.insert(new_name.to_string(), moved);
+    Ok(0)
 }
 
 fn rsplit_path(path: &str) -> (&str, &str) {
